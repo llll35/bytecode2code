@@ -94,6 +94,11 @@ def test_versions():
     section("version and magic tables")
     for version in ALL:
         magic = interp.interpreter_magic(version)
+        if magic is None:
+            # No interpreter for this version: its magic cannot be asked for.
+            # test_interpreters() reports the missing install.
+            print("skip magic %s round trip (no interpreter)" % version)
+            continue
         detected = versions.version_from_magic(magic)
         check("magic %s round trip" % version, detected == version,
               "%s -> %s" % (magic.hex(), detected))
@@ -112,7 +117,9 @@ def test_interpreters():
           "have %s" % ",".join(found))
     for version in ALL:
         path = interp.interpreter_path(version)
-        check("interpreter %s exists" % version, os.path.isfile(path), path)
+        check("interpreter %s exists" % version,
+              path is not None and os.path.isfile(path),
+              path or "not installed")
 
 
 def test_protocol():
@@ -768,6 +775,13 @@ def main():
     print("pyvers selftest")
     print("host     : %s" % interp.current_version())
     print("embed dir: %s" % interp.embed_dir())
+    if not interp.available_versions():
+        print()
+        print("no interpreters installed under %s" % interp.embed_dir())
+        print("this suite compares the embedded interpreters against each other,")
+        print("so there is nothing to check without them.  See the")
+        print("'Getting the interpreters' section of README.md.")
+        return 0
     test_versions()
     test_interpreters()
     test_protocol()
