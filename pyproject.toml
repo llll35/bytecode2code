@@ -1,0 +1,41 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "bytecode2code"
+version = "0.1.0"
+description = "Decompile Python .pyc bytecode back to source, for CPython 3.9 - 3.14"
+readme = "README.md"
+requires-python = ">=3.9"
+license = { text = "MIT" }
+keywords = ["decompiler", "bytecode", "pyc", "python", "disassembler"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.9",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Programming Language :: Python :: 3.14",
+    "Topic :: Software Development :: Disassemblers",
+]
+
+# The project has no third-party dependencies: it uses only the standard
+# library, and dispatches to the CPython interpreters shipped in
+# ``embed_python/`` for anything the running interpreter cannot decode.
+
+[project.scripts]
+bytecode2code = "bytecode2code.main:main"
+
+[tool.setuptools]
+# ``pyvers`` is not installable: it locates its interpreters relative to the
+# repository root, so it is shipped as part of the checkout rather than the
+# wheel.  Only the single-interpreter front end is packaged.
+packages = ["bytecode2code"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

@@ -1,0 +1,13 @@
+- 仍未修复（已在 bugs.md 明确标注）：
+- D2：try 内 break/continue 仍错乱（decomp311 控制流重建）
+- D3：嵌套 finally 仍丢失/重复（decomp311 的 _collect_finally_body / _find_pop_block）
+- D4：循环内 else 仍被重复放入 except 或吞没（_recover_else_clause）
+- P1-4：except* 在 3.11/3.12 被降级为 try/finally: pass（decomp311 未识别 CHECK_EG_MATCH）
+- N3：match 结构被编译为三元表达式，不可恢复
+
+- 新发现 / 恶化（2026-10-18 实测）：
+- P0-1 回归：多上下文管理器 with + return 在所有版本（3.9-3.12）均严重错乱
+  return x+y -> (x+y)(None,None,None)，且 with a as x, b as y 被拆成嵌套 with
+- match 带 dict/list 模式：3.11/3.12 输出完全错误语义（if 1: v=('k',); ('k',); return v）
+- 3.11/3.12 嵌套 try/finally 直接崩溃（DecompilationError: produced no statements）
+- selftest 现状：373 项检查，15 项失败（不是文档声称的 0 失败）

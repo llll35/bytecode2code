@@ -1,0 +1,365 @@
+{
+  "name": "<module>",
+  "qualname": "<module>",
+  "filename": "<pyvers>",
+  "firstlineno": 1,
+  "kind": "module",
+  "signature": "",
+  "tags": [],
+  "flags": 0,
+  "stacksize": 4,
+  "argcount": 0,
+  "posonlyargcount": 0,
+  "kwonlyargcount": 0,
+  "varnames": [],
+  "names": [
+    "x",
+    "Exception",
+    "Foo"
+  ],
+  "freevars": [],
+  "cellvars": [],
+  "consts": [
+    1,
+    2,
+    {
+      "code": "Foo"
+    },
+    "Foo",
+    null
+  ],
+  "instructions": [
+    {
+      "offset": 4,
+      "op": "LOAD_CONST",
+      "arg": 0,
+      "argval": 1,
+      "argrepr": "1",
+      "line": 2,
+      "is_jump_target": false
+    },
+    {
+      "offset": 6,
+      "op": "STORE_NAME",
+      "arg": 0,
+      "argval": "x",
+      "argrepr": "x",
+      "line": 2,
+      "is_jump_target": false
+    },
+    {
+      "offset": 8,
+      "op": "PUSH_NULL",
+      "arg": null,
+      "argval": null,
+      "argrepr": "",
+      "line": 6,
+      "is_jump_target": true
+    },
+    {
+      "offset": 10,
+      "op": "LOAD_BUILD_CLASS",
+      "arg": null,
+      "argval": null,
+      "argrepr": "",
+      "line": 6,
+      "is_jump_target": false
+    },
+    {
+      "offset": 12,
+      "op": "LOAD_CONST",
+      "arg": 2,
+      "argval": {
+        "code": "Foo"
+      },
+      "argrepr": "<code object Foo at 0x000002A7EACF9550, file \"<pyvers>\", line 6>",
+      "line": 6,
+      "is_jump_target": false
+    },
+    {
+      "offset": 14,
+      "op": "MAKE_FUNCTION",
+      "arg": 0,
+      "argval": 0,
+      "argrepr": "",
+      "line": 6,
+      "is_jump_target": false
+    },
+    {
+      "offset": 16,
+      "op": "LOAD_CONST",
+      "arg": 3,
+      "argval": "Foo",
+      "argrepr": "'Foo'",
+      "line": 6,
+      "is_jump_target": false
+    },
+    {
+      "offset": 18,
+      "op": "CALL",
+      "arg": 2,
+      "argval": 2,
+      "argrepr": "",
+      "line": 6,
+      "is_jump_target": false,
+      "nargs": 2
+    },
+    {
+      "offset": 26,
+      "op": "STORE_NAME",
+      "arg": 2,
+      "argval": "Foo",
+      "argrepr": "Foo",
+      "line": 6,
+      "is_jump_target": false
+    },
+    {
+      "offset": 28,
+      "op": "LOAD_CONST",
+      "arg": 4,
+      "argval": null,
+      "argrepr": "None",
+      "line": 6,
+      "is_jump_target": false
+    },
+    {
+      "offset": 28,
+      "op": "RETURN_VALUE",
+      "arg": null,
+      "argval": null,
+      "argrepr": null,
+      "line": 6,
+      "is_jump_target": false
+    },
+    {
+      "offset": 30,
+      "op": "PUSH_EXC_INFO",
+      "arg": null,
+      "argval": null,
+      "argrepr": "",
+      "line": null,
+      "is_jump_target": false
+    },
+    {
+      "offset": 32,
+      "op": "LOAD_NAME",
+      "arg": 1,
+      "argval": "Exception",
+      "argrepr": "Exception",
+      "line": 3,
+      "is_jump_target": false
+    },
+    {
+      "offset": 34,
+      "op": "CHECK_EXC_MATCH",
+      "arg": null,
+      "argval": null,
+      "argrepr": "",
+      "line": 3,
+      "is_jump_target": false
+    },
+    {
+      "offset": 36,
+      "op": "POP_JUMP_IF_FALSE",
+      "arg": 5,
+      "argval": 48,
+      "argrepr": "to 48",
+      "line": 3,
+      "is_jump_target": false
+    },
+    {
+      "offset": 38,
+      "op": "POP_TOP",
+      "arg": null,
+      "argval": null,
+      "argrepr": "",
+      "line": 3,
+      "is_jump_target": false
+    },
+    {
+      "offset": 40,
+      "op": "LOAD_CONST",
+      "arg": 1,
+      "argval": 2,
+      "argrepr": "2",
+      "line": 4,
+      "is_jump_target": false
+    },
+    {
+      "offset": 42,
+      "op": "STORE_NAME",
+      "arg": 0,
+      "argval": "x",
+      "argrepr": "x",
+      "line": 4,
+      "is_jump_target": false
+    },
+    {
+      "offset": 44,
+      "op": "POP_EXCEPT",
+      "arg": null,
+      "argval": null,
+      "argrepr": "",
+      "line": 4,
+      "is_jump_target": false
+    },
+    {
+      "offset": 46,
+      "op": "JUMP_BACKWARD",
+      "arg": 20,
+      "argval": 8,
+      "argrepr": "to 8",
+      "line": 4,
+      "is_jump_target": false
+    },
+    {
+      "offset": 48,
+      "op": "RERAISE",
+      "arg": 0,
+      "argval": 0,
+      "argrepr": "",
+      "line": 3,
+      "is_jump_target": true
+    },
+    {
+      "offset": 50,
+      "op": "COPY",
+      "arg": 3,
+      "argval": 3,
+      "argrepr": "",
+      "line": null,
+      "is_jump_target": false
+    },
+    {
+      "offset": 52,
+      "op": "POP_EXCEPT",
+      "arg": null,
+      "argval": null,
+      "argrepr": "",
+      "line": null,
+      "is_jump_target": false
+    },
+    {
+      "offset": 54,
+      "op": "RERAISE",
+      "arg": 1,
+      "argval": 1,
+      "argrepr": "",
+      "line": null,
+      "is_jump_target": false
+    }
+  ],
+  "exception_entries": [
+    {
+      "start": 4,
+      "end": 12,
+      "target": 30,
+      "depth": 0,
+      "lasti": false
+    },
+    {
+      "start": 30,
+      "end": 74,
+      "target": 50,
+      "depth": 1,
+      "lasti": true
+    },
+    {
+      "start": 48,
+      "end": 98,
+      "target": 50,
+      "depth": 1,
+      "lasti": true
+    }
+  ],
+  "children": [
+    {
+      "name": "Foo",
+      "qualname": "Foo",
+      "ir": {
+        "name": "Foo",
+        "qualname": "Foo",
+        "filename": "<pyvers>",
+        "firstlineno": 6,
+        "kind": "function",
+        "signature": "",
+        "tags": [],
+        "flags": 0,
+        "stacksize": 1,
+        "argcount": 0,
+        "posonlyargcount": 0,
+        "kwonlyargcount": 0,
+        "varnames": [],
+        "names": [
+          "__name__",
+          "__module__",
+          "__qualname__"
+        ],
+        "freevars": [],
+        "cellvars": [],
+        "consts": [
+          "Foo",
+          null
+        ],
+        "instructions": [
+          {
+            "offset": 2,
+            "op": "LOAD_NAME",
+            "arg": 0,
+            "argval": "__name__",
+            "argrepr": "__name__",
+            "line": 6,
+            "is_jump_target": false
+          },
+          {
+            "offset": 4,
+            "op": "STORE_NAME",
+            "arg": 1,
+            "argval": "__module__",
+            "argrepr": "__module__",
+            "line": 6,
+            "is_jump_target": false
+          },
+          {
+            "offset": 6,
+            "op": "LOAD_CONST",
+            "arg": 0,
+            "argval": "Foo",
+            "argrepr": "'Foo'",
+            "line": 6,
+            "is_jump_target": false
+          },
+          {
+            "offset": 8,
+            "op": "STORE_NAME",
+            "arg": 2,
+            "argval": "__qualname__",
+            "argrepr": "__qualname__",
+            "line": 6,
+            "is_jump_target": false
+          },
+          {
+            "offset": 10,
+            "op": "LOAD_CONST",
+            "arg": 1,
+            "argval": null,
+            "argrepr": "None",
+            "line": 7,
+            "is_jump_target": false
+          },
+          {
+            "offset": 10,
+            "op": "RETURN_VALUE",
+            "arg": null,
+            "argval": null,
+            "argrepr": null,
+            "line": 7,
+            "is_jump_target": false
+          }
+        ],
+        "exception_entries": [],
+        "children": []
+      }
+    }
+  ]
+}

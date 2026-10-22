@@ -1,0 +1,53 @@
+# --- Python ---
+__pycache__/
+*.py[cod]
+*$py.class
+
+# ...except the compiled test corpus: these are fixtures, not build artefacts,
+# and cannot be regenerated without the exact interpreter versions.
+!tests/samples/*.pyc
+*.egg-info/
+.eggs/
+build/
+dist/
+
+# --- Virtual environments ---
+.venv/
+venv/
+env/
+
+# --- Test / tool caches ---
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# --- Editors and OS ---
+.idea/
+.vscode/
+*.swp
+.DS_Store
+Thumbs.db
+
+# --- Generated decompiler output ---
+debug/outputs/
+*.dis.txt
+
+# --- Scratch probes (kept out of the tree on purpose) ---
+_scratch/pyc/
+_scratch/*.txt
+_scratch/*.out
+_scratch/*.err
+_scratch/*.pid
+
+# --- Vendored interpreters (download on demand; see README) ---
+embed_python/
+
+# --- Local tooling state (not project content) ---
+.workbuddy-ai/
+.easyclaw/
+.venv.bak
+*.bak
+*.bak.*
+opencode_session.bat
