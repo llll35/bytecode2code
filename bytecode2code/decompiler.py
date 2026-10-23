@@ -5141,7 +5141,11 @@ class Decompiler:
                     body_start = after
             if loop_var is None:
                 for j in range(idx + 1, min(end_idx, idx + 3)):
-                    if instructions[j].opname in ("STORE_FAST", "STORE_NAME", "STORE_GLOBAL"):
+                    if instructions[j].opname in ("STORE_FAST", "STORE_NAME",
+                                                 "STORE_GLOBAL", "STORE_DEREF"):
+                        # A loop variable that a nested function closes over
+                        # lives in a cell, so the compiler stores it with
+                        # ``STORE_DEREF`` instead of ``STORE_FAST``.
                         loop_var = ASTNode.make_Name(str(instructions[j].argval), ast.Store())
                         body_start = j + 1
                         break

@@ -77,6 +77,17 @@ PROBES = {
     # it: it copies that code after the handler instead.  Both the plain and
     # the compound value exercise the copy, which used to be emitted twice.
     "withstmt_expr": "def f(p):\n    with open(p) as fh:\n        d = fh.read()\n    return d + 1\n",
+    # A loop variable a nested function closes over lives in a cell, so the
+    # compiler binds it with ``STORE_DEREF`` rather than ``STORE_FAST``.
+    "cellloop": (
+        "def f(items):\n"
+        "    acc = []\n"
+        "    for x in items:\n"
+        "        acc.append(x)\n"
+        "    def g():\n"
+        "        return x\n"
+        "    return acc, g\n"
+    ),
     "nonlocal": (
         "def f(e):\n"
         "    g = e\n"
