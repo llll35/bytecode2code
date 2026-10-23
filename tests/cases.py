@@ -73,6 +73,10 @@ PROBES = {
     ),
     "ifexp2": "def f(a, b, c, d):\n    return (a if b else c) if d else (c if a else b)\n",
     "withstmt": "def f(p):\n    with open(p, encoding='utf-8') as fh:\n        d = fh.read()\n    return d\n",
+    # 3.12 has no jump from a ``with`` block's normal path to the code behind
+    # it: it copies that code after the handler instead.  Both the plain and
+    # the compound value exercise the copy, which used to be emitted twice.
+    "withstmt_expr": "def f(p):\n    with open(p) as fh:\n        d = fh.read()\n    return d + 1\n",
     "nonlocal": (
         "def f(e):\n"
         "    g = e\n"

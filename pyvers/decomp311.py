@@ -195,6 +195,16 @@ _WITH_TAIL_OPS = _HANDLER_NOISE | frozenset((
     'WITH_EXCEPT_START', 'POP_JUMP_IF_TRUE', 'RERAISE',
 ))
 
+#: Opcodes that end an expression statement.  Used to bound the run of
+#: instructions that make up the ``return`` 3.12 copies behind a ``with``
+#: handler, so the copy can be recognised by comparing the two runs.
+_STMT_BREAK_OPS = frozenset((
+    'POP_TOP', 'STORE_FAST', 'STORE_NAME', 'STORE_GLOBAL', 'STORE_DEREF',
+    'STORE_ATTR', 'STORE_SUBSCR', 'POP_BLOCK', 'POP_EXCEPT',
+    'JUMP_FORWARD', 'JUMP_BACKWARD', 'JUMP_BACKWARD_NO_INTERRUPT',
+    'JUMP_ABSOLUTE', 'RETURN_VALUE', 'RETURN_CONST', 'RERAISE',
+))
+
 
 def _resolve(raw, code):
     """Resolve one argument the way the 3.9 disassembler would.
@@ -1052,7 +1062,68 @@ class Rewriter(object):
                 self._drops.update(
                     raw.offset for raw in raw_list[handler:index]
                 )
+                # 3.12 has no jump from the normal path to the code behind the
+                # block -- it *copies* that code after the handler so the
+                # handler path can still return the value the body computed.
+                # The copy is the same statement as the run that ends right
+                # before the handler; leaving it in emits the statement twice.
+                copy_end = self._duplicated_exit_run(handler, index)
+                if copy_end is not None:
+                    self._drops.update(
+                        raw.offset for raw in raw_list[index:copy_end]
+                    )
             return
+
+    @staticmethod
+    def _normalised_opname(instr) -> str:
+        """Opcode name with 3.12's checked loads folded onto their plain form.
+
+        The copy 3.12 emits after a handler uses ``LOAD_FAST_CHECK`` where the
+        original used ``LOAD_FAST``; the two load the same local.
+        """
+        if instr.opname == 'LOAD_FAST_CHECK':
+            return 'LOAD_FAST'
+        return instr.opname
+
+    def _duplicated_exit_run(self, handler: int, after: int):
+        """End index of the exit statement 3.12 copies after a ``with`` handler.
+
+        *after* is the first instruction behind the handler.  The block's
+        normal path ends right in front of the handler, so the run of
+        instructions there is the statement the compiler duplicated; the copy
+        behind the handler has to match it instruction for instruction
+        (modulo ``LOAD_FAST_CHECK``) before it can be dropped.
+        """
+        raw_list = self.raw
+        index = handler - 1
+        if index < 0 or raw_list[index].opname not in (
+            'RETURN_VALUE', 'RETURN_CONST'
+        ):
+            return None
+        run = [index]
+        index -= 1
+        while index >= 0 and len(run) < 8:
+            if raw_list[index].opname in _STMT_BREAK_OPS:
+                break
+            run.append(index)
+            index -= 1
+        run.reverse()
+        before = [(self._normalised_opname(raw_list[i]), raw_list[i].argval)
+                  for i in run]
+
+        copy = []
+        index = after
+        while index < len(raw_list) and len(copy) < len(before):
+            opname = self._normalised_opname(raw_list[index])
+            if opname in _STMT_BREAK_OPS and opname not in (
+                'RETURN_VALUE', 'RETURN_CONST'
+            ):
+                return None
+            copy.append((opname, raw_list[index].argval))
+            index += 1
+        if copy != before:
+            return None
+        return index
 
     def _analyse_try(self):
         """Rebuild the 3.9 ``SETUP_FINALLY``/``POP_BLOCK`` pair from the table.
