@@ -219,25 +219,56 @@ class Decompiler310(_BaseDecompiler):
             j += 1
         if j >= end or j + 1 >= len(instructions):
             return None
-        exit_idx = self._find_target_idx(
-            instructions, self._jump_target(instructions[j])
-        )
-        if exit_idx <= j:
-            return None
-        # The 3.10 back edge jumps to the first instruction *after* the guard.
-        body_offset = instructions[j + 1].offset
+        guard = instructions[j]
+        # 3.12 inverts the guard: the condition jumps *into* the body and the
+        # unconditional jump behind it leaves the loop, aimed back at the
+        # enclosing loop's iterator.  3.10/3.11 keep the guard in front and jump
+        # forward to the exit instead.
+        if (guard.opname == "POP_JUMP_IF_TRUE"
+                and j + 2 < len(instructions)
+                and self._jump_target(guard) == instructions[j + 2].offset
+                and instructions[j + 1].opname in _JUMP_OPS):
+            body_start = j + 2
+            body_offset = instructions[body_start].offset
+            exit_idx = self._find_target_idx(
+                instructions, self._jump_target(instructions[j + 1])
+            )
+        else:
+            exit_idx = self._find_target_idx(
+                instructions, self._jump_target(guard)
+            )
+            if exit_idx <= j:
+                return None
+            # The 3.10 back edge jumps to the first instruction *after* the guard.
+            body_offset = instructions[j + 1].offset
+            body_start = j + 1
         # 3.10 exits when the condition turns false and jumps back on
         # ``POP_JUMP_IF_TRUE``; 3.12 kept the duplicated condition but guards it
         # with ``POP_JUMP_IF_FALSE`` followed by an unconditional back edge.
         # Either instruction identifies the same body start.
         back_jump = None
-        for k in range(j + 1, exit_idx):
-            ins = instructions[k]
-            if ins.opname not in _POP_JUMPS and ins.opname not in _JUMP_OPS:
-                continue
-            if self._jump_target(ins) == body_offset:
-                back_jump = k
-                break
+        if exit_idx > body_start:
+            for k in range(body_start, exit_idx):
+                ins = instructions[k]
+                if ins.opname not in _POP_JUMPS and ins.opname not in _JUMP_OPS:
+                    continue
+                if self._jump_target(ins) == body_offset:
+                    back_jump = k
+                    break
+        else:
+            # The exit points back at an enclosing loop, so there is no forward
+            # target to bound the body with: scan until the loop's own exit
+            # jump, the next backward jump that does not return to the body.
+            for k in range(body_start, len(instructions)):
+                ins = instructions[k]
+                if ins.opname not in _POP_JUMPS and ins.opname not in _JUMP_OPS:
+                    continue
+                target = self._jump_target(ins)
+                if target == body_offset:
+                    back_jump = k
+                    break
+                if target is not None and target < ins.offset:
+                    break
         if back_jump is None:
             return None
         # ``back_jump`` sits *after* the duplicated condition; the body ends

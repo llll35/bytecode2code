@@ -3414,16 +3414,32 @@ class Decompiler:
             return None
         target = int(instructions[j].argval if instructions[j].argval is not None else 0)
         exit_idx = self._find_target_idx(instructions, target)
-        if exit_idx <= j:
-            return None
         head_offset = head.offset
         back_edge = None
-        for k in range(j + 1, exit_idx):
-            ins = instructions[k]
-            if ins.opname in ("JUMP_ABSOLUTE", "JUMP_FORWARD"):
-                jt = int(ins.argval if ins.argval is not None else 0)
-                if jt == head_offset:
-                    back_edge = k
+        if exit_idx > j:
+            for k in range(j + 1, exit_idx):
+                ins = instructions[k]
+                if ins.opname in ("JUMP_ABSOLUTE", "JUMP_FORWARD"):
+                    jt = int(ins.argval if ins.argval is not None else 0)
+                    if jt == head_offset:
+                        back_edge = k
+        elif instructions[exit_idx].opname in ("FOR_ITER", "GET_ITER"):
+            # The condition's false branch leaves the loop *backwards*: CPython
+            # aims it at the enclosing for loop's iterator, so ending this loop
+            # continues the outer one.  A ``while`` nested directly in a ``for``
+            # compiles to this shape, and there is no forward exit target to
+            # bound the body with.
+            for k in range(j + 1, len(instructions)):
+                ins = instructions[k]
+                if ins.opname in ("FOR_ITER", "GET_ITER"):
+                    break  # another loop sits in between: not the plain shape
+                if ins.opname in ("JUMP_ABSOLUTE", "JUMP_FORWARD"):
+                    jt = int(ins.argval if ins.argval is not None else 0)
+                    if jt == head_offset:
+                        back_edge = k
+                        break
+                    if jt < ins.offset:
+                        break  # some other loop's back edge: the body ends here
         if back_edge is None:
             return None
         return j, back_edge, self._compute_loop_end(instructions, start, back_edge)
@@ -3458,16 +3474,49 @@ class Decompiler:
         if not cond_stack:
             return
         cond = cond_stack[-1]
-        if instructions[cond_jump].opname == "POP_JUMP_IF_TRUE":
+        # 3.12's inverted guard jumps *into* the body when the condition holds,
+        # so the test is the condition as written rather than its negation.
+        if instructions[cond_jump].opname == "POP_JUMP_IF_TRUE" \
+                and not self._inverted_while_guard(instructions, cond_jump):
             cond = ast.UnaryOp(op=ast.Not(), operand=cond)
+        # The body starts after the guard, or after the exit jump that follows
+        # it when the guard is inverted.
+        body_start = cond_jump + 2 if self._inverted_while_guard(
+            instructions, cond_jump) else cond_jump + 1
         body_stmts = self._emit_loop_body(
-            code, instructions, cond_jump + 1, back_edge, head_offset, exit_offset,
+            code, instructions, body_start, back_edge, head_offset, exit_offset,
         )
-        stmts.append(
-            ast.While(test=cond, body=body_stmts, orelse=self._emit_while_else(
+        # A backward exit -- the loop is nested in a ``for`` and its false
+        # branch continues the outer loop -- has no ``else`` clause: the
+        # target is the enclosing loop's iterator, not code behind this loop.
+        # An inverted guard points at the body, which is not an exit either.
+        orelse = []
+        if not self._inverted_while_guard(instructions, cond_jump) \
+                and self._jump_target(instructions[cond_jump]) >= head_offset:
+            orelse = self._emit_while_else(
                 code, instructions, cond_jump, exit_offset
-            ))
+            )
+        stmts.append(
+            ast.While(test=cond, body=body_stmts, orelse=orelse)
         )
+
+    def _inverted_while_guard(self, instructions, cond_jump: int) -> bool:
+        """Is the guard the 3.12 form, which jumps into the body?
+
+        3.12 guards a ``while`` with ``POP_JUMP_IF_TRUE`` aimed at the body and
+        puts the loop's exit in the unconditional jump right behind it, where
+        earlier versions guard with ``POP_JUMP_IF_FALSE`` and jump forward to
+        the exit.
+        """
+        guard = instructions[cond_jump]
+        if guard.opname != "POP_JUMP_IF_TRUE":
+            return False
+        if cond_jump + 2 >= len(instructions):
+            return False
+        return (self._jump_target(guard) == instructions[cond_jump + 2].offset
+                and instructions[cond_jump + 1].opname in (
+                    "JUMP_ABSOLUTE", "JUMP_FORWARD", "JUMP_BACKWARD",
+                    "JUMP_BACKWARD_NO_INTERRUPT"))
 
     def _emit_while_else(
         self,

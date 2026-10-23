@@ -97,6 +97,16 @@ PROBES = {
         "        return g\n"
         "    return inner()\n"
     ),
+    # A ``while`` nested directly in a ``for`` compiles its false branch as a
+    # jump *back* to the enclosing iterator instead of forward to an exit, so
+    # there is no forward target to bound the body with.
+    "nested_while": (
+        "def f(xs):\n"
+        "    for x in xs:\n"
+        "        while x:\n"
+        "            x -= 1\n"
+        "    return 1\n"
+    ),
     "starcall": "def f(a, b, c, *r, **kw):\n    args = [a, b, *r, c]\n    m = {**kw, 'z': 9}\n    return print(*args, **m)\n",
     "yield": (
         "def f(n):\n"
