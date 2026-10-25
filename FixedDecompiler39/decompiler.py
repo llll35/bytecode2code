@@ -6295,7 +6295,3 @@ class Decompiler:
                 return "yield"
             return f"(yield {self._expr_to_str(expr.value)})"
         return f"<{type(expr).__name__}>"
-#   F I X E D   l i m i t a t i o n :   f i l t e r   i n v a l i d   N o n e ( N o n e ,   N o n e )   r e c o n s t r u c t i o n  
-         s o u r c e   =   s o u r c e . r e p l a c e ( " N o n e ( N o n e ,   N o n e ) " ,   " N o n e " )  
-         r e t u r n   s o u r c e  
- 
