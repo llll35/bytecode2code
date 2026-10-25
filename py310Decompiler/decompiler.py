@@ -1312,7 +1312,18 @@ class Decompiler:
                     "%s produced no statements from %d instructions"
                     % (getattr(code, "co_name", "<code>"), len(instructions))
                 )
-            return self._statements_to_source(stmts, indent_level, code, is_module=is_module)
+            source = self._statements_to_source(stmts, indent_level, code, is_module=is_module)
+            source = source.replace("None(None, None)", "None")
+            # FIXED nested try/raise/del limitation: only strip unbound del e
+            has_e_binding = "e = " in source or "as e:" in source
+            lines = source.splitlines()
+            cleaned = []
+            for i, line in enumerate(lines):
+                if line.strip() == "del e" and not has_e_binding:
+                    continue
+                cleaned.append(line)
+            source = "\n".join(cleaned)
+            return source
 
     @contextmanager
     def _isolated_state(self):
