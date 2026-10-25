@@ -1376,13 +1376,21 @@ class Decompiler:
             back_edge = self._find_while_true_back_edge(instructions, i, n)
             if back_edge is not None:
                 loop_end = self._compute_loop_end(instructions, i, back_edge)
+                synthetic_exits = [
+                    self._find_target_idx(instructions, self._jump_target(ins))
+                    for ins in instructions[i:back_edge]
+                    if getattr(ins, "synthetic_loop_exit", False)
+                ]
+                if synthetic_exits:
+                    loop_end = min(synthetic_exits)
                 exit_offset = (
                     instructions[loop_end].offset
                     if loop_end < total
                     else instructions[-1].offset + 2
                 )
                 body_stmts = self._emit_loop_body(
-                    code, instructions, i, back_edge, instructions[i].offset, exit_offset,
+                    code, instructions, i, min(back_edge, loop_end),
+                    instructions[i].offset, exit_offset,
                 )
                 stmts.append(
                     ast.While(test=ast.Constant(value=True), body=body_stmts, orelse=[])
@@ -1630,6 +1638,9 @@ class Decompiler:
             stack.append(ASTNode.make_Name(str(instr.argval), ast.Load()))
             return 1
         if opname == "LOAD_FAST":
+            if instr.argval in getattr(code, "co_cellvars", ()):
+                stack.append(_ClosureRef(str(instr.argval)))
+                return 1
             stack.append(ASTNode.make_Name(str(instr.argval), ast.Load()))
             return 1
         if opname == "LOAD_GLOBAL":
@@ -2230,12 +2241,15 @@ class Decompiler:
             # A jump back to the loop head is the implicit back edge CPython emits
             # for normal try-body completion, not a source-level ``continue``.
             tail = try_end_idx + 1
+            body_continues = False
             if tail < len(instructions) and instructions[tail].opname in (
                 "JUMP_ABSOLUTE", "JUMP_FORWARD",
             ):
                 tail_jump = self._classify_jump(instructions, instructions[tail])
                 if isinstance(tail_jump, ast.Break):
                     try_body.append(tail_jump)
+                body_continues = isinstance(tail_jump, ast.Continue)
+            body_breaks = bool(try_body and isinstance(try_body[-1], ast.Break))
             if not try_body:
                 try_body = [ast.Pass()]
             handlers: List[ast.ExceptHandler] = []
@@ -2319,7 +2333,9 @@ class Decompiler:
                             skip_to = resume + 2
             else:
                 handlers, orelse, post = parsed
-                if not orelse:
+                if body_breaks or body_continues:
+                    orelse = []
+                elif not orelse:
                     orelse = self._recover_else_clause(
                         code, instructions, try_end_idx, handler_start_idx, post)
                 skip_to = post
@@ -3436,7 +3452,21 @@ class Decompiler:
         exit_idx = self._find_target_idx(instructions, target)
         head_offset = head.offset
         back_edge = None
-        if exit_idx > j:
+        inverted = self._inverted_while_guard(instructions, j)
+        if inverted:
+            for k in range(exit_idx, end):
+                ins = instructions[k]
+                if ins.opname in ("FOR_ITER", "GET_ITER"):
+                    break
+                if ins.opname not in ("JUMP_ABSOLUTE", "JUMP_FORWARD"):
+                    continue
+                jt = int(ins.argval if ins.argval is not None else 0)
+                if jt == head_offset:
+                    back_edge = k
+                    break
+                if jt < ins.offset:
+                    break
+        elif exit_idx > j:
             for k in range(j + 1, exit_idx):
                 ins = instructions[k]
                 if ins.opname in ("JUMP_ABSOLUTE", "JUMP_FORWARD"):
@@ -4168,6 +4198,29 @@ class Decompiler:
         target_idx = self._find_target_idx(instructions, self._jump_target(instructions[g]))
         if target_idx > end:
             return None
+        branch_guard = self._find_value_guard(instructions, g + 1, end)
+        if branch_guard is not None and branch_guard < target_idx:
+            merge_idx = self._find_target_idx(
+                instructions, self._jump_target(instructions[branch_guard])
+            )
+            if merge_idx > target_idx and merge_idx <= end:
+                branch_value = self._eval_value_operand(
+                    code, instructions, g + 1, branch_guard, base
+                )
+                fallback = self._eval_value_operand(
+                    code, instructions, target_idx, merge_idx, base
+                )
+                if (
+                    self._is_ifexp_value_stack(branch_value, base)
+                    and self._is_ifexp_value_stack(fallback, base)
+                ):
+                    first = self._make_boolop(op, left, branch_value[-1])
+                    outer = ast.Or() if isinstance(op, ast.And) else ast.And()
+                    return (
+                        list(base)
+                        + [self._make_boolop(outer, first, fallback[-1])],
+                        merge_idx,
+                    )
         # The operand is evaluated on the fall-through path; a nested
         # short-circuit makes that path empty, and the operand then starts at
         # the jump target and runs up to its own merge point.
@@ -4176,6 +4229,12 @@ class Decompiler:
             right = self._eval_value_operand(code, instructions, g + 1, target_idx, base)
         if self._is_ifexp_value_stack(right, base):
             return list(base) + [self._make_boolop(op, left, right[-1])], target_idx
+        nested = self._parse_value_boolop_at(code, instructions, g + 1, end, base)
+        if nested is not None and nested[1] >= target_idx:
+            return (
+                list(base) + [self._make_boolop(op, left, nested[0][-1])],
+                nested[1],
+            )
         nested = self._parse_value_boolop_at(code, instructions, target_idx, end, base)
         if nested is None:
             return None

@@ -21,11 +21,15 @@ from tests.equivalence import compare, version_of
 
 def _folder(version: str):
     """Import the self-contained decompiler for *version*."""
+    if version == "3.15":
+        return importlib.import_module("Py315Decompiler")
     return importlib.import_module(
         "py%sDecompiler" % version.replace(".", ""))
 
 
 def _parser(version: str):
+    if version == "3.15":
+        return importlib.import_module("Py315Decompiler.pyc_parser")
     return importlib.import_module(
         "py%sDecompiler.pyc_parser" % version.replace(".", ""))
 

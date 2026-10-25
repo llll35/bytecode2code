@@ -30,7 +30,7 @@ VERBOSE = "--verbose" in sys.argv or "-v" in sys.argv
 #: Every bytecode version the repository ships a self-contained decompiler
 #: for.  The probes run at all of them; a sample only runs at the version that
 #: wrote its ``.pyc``.
-SUPPORTED_VERSIONS = ("3.9", "3.10", "3.11", "3.12", "3.13", "3.14")
+SUPPORTED_VERSIONS = ("3.9", "3.10", "3.11", "3.12", "3.13", "3.14", "3.15")
 
 #: Set in a child process: the bytecode version whose samples it owns.
 GROUP_ENV = "BYTECODE2CODE_TESTS_GROUP"

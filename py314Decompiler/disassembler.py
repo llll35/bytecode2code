@@ -39,6 +39,7 @@ class Instruction:
     argrepr: str
     line_no: Optional[int] = None
     is_jump_target: bool = False
+    synthetic_loop_exit: bool = False
 
     def __str__(self):
         parts = []

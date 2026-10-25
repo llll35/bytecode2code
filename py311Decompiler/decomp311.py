@@ -388,6 +388,7 @@ class Rewriter(object):
                     self.jump_targets.add(int(raw.argval))
         self._drops = set()
         self._retarget = {}
+        self._loop_breaks = {}
         self._handler_heads = set()
         self.with_setups, self.with_closes, self.with_swaps, \
             self.with_exits = self._analyse_with()
@@ -396,6 +397,7 @@ class Rewriter(object):
         self.comprehensions = self._analyse_comprehensions()
         self._mark_dead_handlers()
         self._redirect_handler_exits()
+        self._analyse_exception_loop_exits()
 
     def _analyse_super(self):
         """Locate 3.12's ``LOAD_SUPER_ATTR`` and undo the ``super()`` shortcut.
@@ -626,6 +628,9 @@ class Rewriter(object):
                 if target >= entry.target:
                     # Already leaves the handler; nothing to re-aim.
                     break
+                if target < entry.end:
+                    # This is a real loop continue, not a duplicated tail.
+                    break
                 # The code the handler jumps back to is the code that follows
                 # the whole ``try`` statement.  3.11/3.12 place it before the
                 # handler, where the reader would take it for the ``else``
@@ -635,6 +640,49 @@ class Rewriter(object):
                 self._retarget[raw.offset] = merge
                 self._save_tail_for_merge(target, merge)
                 break
+
+    def _analyse_exception_loop_exits(self):
+        """Retarget handler back-edges past dropped loop-head NOPs."""
+        raw_list = self.raw
+        by_offset = {raw.offset: index for index, raw in enumerate(raw_list)}
+        jump_ops = set(dis.hasjabs) | set(dis.hasjrel)
+        for entry in _exception_entries(self.code):
+            if entry.start not in by_offset or entry.target not in by_offset:
+                continue
+            loop_heads = set()
+            for raw in raw_list:
+                if raw.offset < entry.target or raw.opcode not in jump_ops \
+                        or not isinstance(raw.argval, int) \
+                        or raw.argval >= entry.start:
+                    continue
+                target = by_offset.get(raw.argval)
+                if target is not None and raw_list[target].opname == 'NOP':
+                    loop_heads.add(raw.argval)
+            if not loop_heads:
+                continue
+            for loop_head in loop_heads:
+                target_index = by_offset[loop_head]
+                while target_index < len(raw_list) and raw_list[target_index].opname in (
+                    'NOP', 'RESUME', 'CACHE'
+                ):
+                    target_index += 1
+                if target_index >= len(raw_list):
+                    continue
+                target_offset = raw_list[target_index].offset
+                self.jump_targets.add(target_offset)
+                for raw in raw_list:
+                    if raw.opcode in jump_ops and raw.argval == loop_head:
+                        self._retarget[raw.offset] = target_offset
+            end = by_offset.get(entry.end)
+            if end is None or raw_list[end].opname != 'NOP':
+                continue
+            exit_index = end + 1
+            while exit_index < len(raw_list) and raw_list[exit_index].opname in (
+                'NOP', 'RESUME', 'CACHE'
+            ):
+                exit_index += 1
+            if exit_index < len(raw_list):
+                self._loop_breaks[raw_list[end].offset] = raw_list[exit_index].offset
 
     def _save_tail_for_merge(self, tail_start, merge_offset):
         """Save tail instructions to be emitted at the merge point.
@@ -782,6 +830,7 @@ class Rewriter(object):
         inner.name_closes = {}
         inner._drops = set()
         inner._retarget = {}
+        inner._loop_breaks = {}
         inner._handler_heads = set()
         inner.supers = inner._analyse_super()
         inner.comprehensions = inner._analyse_comprehensions()
@@ -1896,6 +1945,11 @@ class Rewriter(object):
         raw_list = self.raw
         raw = raw_list[index]
         opname = raw.opname
+        loop_exit = self._loop_breaks.get(raw.offset)
+        if loop_exit is not None:
+            out.append(self._make(raw, 'JUMP_ABSOLUTE', loop_exit, loop_exit,
+                                  synthetic_loop_exit=True))
+            return index + 1
         if index in runs:
             return self._emit_store_run(index, runs[index], out)
         if opname == 'COPY':
@@ -2203,7 +2257,8 @@ class Rewriter(object):
             index = end
         return runs
 
-    def _make(self, raw, opname, arg, argval, line_no=None):
+    def _make(self, raw, opname, arg, argval, line_no=None,
+              synthetic_loop_exit=False):
         """Build one 3.9 :class:`Instruction` standing in for *raw*."""
         if line_no is None:
             line_no = raw.starts_line
@@ -2216,6 +2271,7 @@ class Rewriter(object):
             argrepr=_repr_of(opname, arg, argval),
             line_no=line_no,
             is_jump_target=raw.offset in self.jump_targets,
+            synthetic_loop_exit=synthetic_loop_exit,
         )
 
 
@@ -2380,4 +2436,3 @@ class Decompiler311(Decompiler310):
 
 def make_decompiler():
     return Decompiler311()
-

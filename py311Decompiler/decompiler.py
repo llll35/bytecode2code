@@ -1365,13 +1365,21 @@ class Decompiler:
             back_edge = self._find_while_true_back_edge(instructions, i, n)
             if back_edge is not None:
                 loop_end = self._compute_loop_end(instructions, i, back_edge)
+                synthetic_exits = [
+                    self._find_target_idx(instructions, self._jump_target(ins))
+                    for ins in instructions[i:back_edge]
+                    if getattr(ins, "synthetic_loop_exit", False)
+                ]
+                if synthetic_exits:
+                    loop_end = min(synthetic_exits)
                 exit_offset = (
                     instructions[loop_end].offset
                     if loop_end < total
                     else instructions[-1].offset + 2
                 )
                 body_stmts = self._emit_loop_body(
-                    code, instructions, i, back_edge, instructions[i].offset, exit_offset,
+                    code, instructions, i, min(back_edge, loop_end),
+                    instructions[i].offset, exit_offset,
                 )
                 stmts.append(
                     ast.While(test=ast.Constant(value=True), body=body_stmts, orelse=[])
@@ -1430,7 +1438,8 @@ class Decompiler:
                 i += ifexp_consumed
                 continue
             # Implicit `return None` tail of a function body.
-            if i + 1 == total - 1 and instr.opname == "LOAD_CONST" and instr.argval is None:
+            if (i + 1 == total - 1 and instr.opname == "LOAD_CONST"
+                    and instr.argval is None and not instr.is_jump_target):
                 next_instr = instructions[i + 1] if i + 1 < total else None
                 if next_instr and next_instr.opname == "RETURN_VALUE":
                     break
@@ -2108,6 +2117,7 @@ class Decompiler:
                                 for t in range(clause_len)] != handler_copy:
                             continue
                         self._handled_ranges.append((j + 1, k))
+            deferred_else: List[ast.stmt] = []
             try_stack: List[ast.expr] = []
             try_body = self._emit_statements(
                 code, instructions, is_module=False, start=instr_start + 1, end=try_end_idx,
@@ -2196,7 +2206,7 @@ class Decompiler:
                     start=try_end_idx + 1, end=_return_idx + 1,
                     out_stack=[],
                 )
-                try_body.extend(tail)
+                deferred_else = tail
             # A ``return`` as the last statement of a try body compiles to
             # ``POP_BLOCK`` + (optional loop-teardown pair) + ``RETURN_VALUE``;
             # the returned value is still on the virtual stack when the body
@@ -2231,6 +2241,7 @@ class Decompiler:
                                                   handler_start_idx, try_end_idx)
             if parsed is None or self._is_bare_finally(instructions,
                                                        handler_start_idx):
+                try_body.extend(deferred_else)
                 # ``SETUP_FINALLY`` whose handler only re-raises is a
                 # ``try``/``finally``: the clause was emitted inline where the
                 # protected range ends, and the handler runs a second copy of it
@@ -2304,6 +2315,7 @@ class Decompiler:
                             skip_to = resume + 2
             else:
                 handlers, orelse, post = parsed
+                orelse = deferred_else + orelse
                 if not orelse:
                     orelse = self._recover_else_clause(
                         code, instructions, try_end_idx, handler_start_idx, post)

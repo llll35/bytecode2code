@@ -2108,6 +2108,7 @@ class Decompiler:
                                 for t in range(clause_len)] != handler_copy:
                             continue
                         self._handled_ranges.append((j + 1, k))
+            deferred_else: List[ast.stmt] = []
             try_stack: List[ast.expr] = []
             try_body = self._emit_statements(
                 code, instructions, is_module=False, start=instr_start + 1, end=try_end_idx,
@@ -2196,7 +2197,7 @@ class Decompiler:
                     start=try_end_idx + 1, end=_return_idx + 1,
                     out_stack=[],
                 )
-                try_body.extend(tail)
+                deferred_else = tail
             # A ``return`` as the last statement of a try body compiles to
             # ``POP_BLOCK`` + (optional loop-teardown pair) + ``RETURN_VALUE``;
             # the returned value is still on the virtual stack when the body
@@ -2231,6 +2232,7 @@ class Decompiler:
                                                   handler_start_idx, try_end_idx)
             if parsed is None or self._is_bare_finally(instructions,
                                                        handler_start_idx):
+                try_body.extend(deferred_else)
                 # ``SETUP_FINALLY`` whose handler only re-raises is a
                 # ``try``/``finally``: the clause was emitted inline where the
                 # protected range ends, and the handler runs a second copy of it
@@ -2304,6 +2306,7 @@ class Decompiler:
                             skip_to = resume + 2
             else:
                 handlers, orelse, post = parsed
+                orelse = deferred_else + orelse
                 if not orelse:
                     orelse = self._recover_else_clause(
                         code, instructions, try_end_idx, handler_start_idx, post)

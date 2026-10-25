@@ -183,7 +183,7 @@ def _duplicates_for(instr):
 #: Opcodes ``MAKE_FUNCTION`` may consume between the function object it wraps
 #: and the ``LOAD_CONST`` that produced it.
 _MAKE_OPERANDS = frozenset((
-    'LOAD_CONST', 'LOAD_CLOSURE', 'BUILD_TUPLE', 'BUILD_CONST_KEY_MAP',
+    'LOAD_CONST', 'LOAD_CLOSURE', 'LOAD_DEREF', 'BUILD_TUPLE', 'BUILD_CONST_KEY_MAP',
     'BUILD_MAP', 'BUILD_LIST', 'BUILD_SET', 'DICT_MERGE', 'DICT_UPDATE',
     'LIST_EXTEND', 'SET_UPDATE', 'LOAD_FAST', 'LOAD_NAME', 'LOAD_GLOBAL',
 ))
@@ -440,8 +440,10 @@ class Rewriter(object):
         self.try_setups, self.try_closes = self._analyse_try()
         self.supers = self._analyse_super()
         self.comprehensions = self._analyse_comprehensions()
+        self._analyse_tuple_generator_optimisations()
         self._mark_dead_handlers()
         self._redirect_handler_exits()
+        self._analyse_exception_loop_exits()
 
     def _normalise_raw(self, raw_list):
         """Fold 3.13/3.14-only encodings onto the 3.9 vocabulary.
@@ -638,6 +640,71 @@ class Rewriter(object):
             found[raw_list[head].offset] = (name, n, end, loops, resume)
         return found
 
+    def _analyse_tuple_generator_optimisations(self):
+        """Remove CPython's guarded tuple-of-generator fast path.
+
+        3.14+ inlines a list-building fast path for ``tuple(generator)`` after
+        checking that the callable is still the builtin ``tuple``. The false
+        branch retains the original callable and contains the ordinary
+        generator call, which is the source-level shape the reader understands.
+        """
+        raw_list = self.raw
+        by_offset = {raw.offset: index for index, raw in enumerate(raw_list)}
+        for index, raw in enumerate(raw_list):
+            if raw.opname != 'LOAD_GLOBAL' or raw.argval != 'tuple':
+                continue
+            if index + 4 >= len(raw_list):
+                continue
+            duplicate, check, identity, branch = raw_list[index + 1:index + 5]
+            if (
+                duplicate.opname != 'COPY'
+                and duplicate.opname != 'DUP_TOP'
+            ):
+                continue
+            checked_name = check.argval
+            if check.opname == 'LOAD_COMMON_CONSTANT':
+                checked_name = getattr(_common_constant(check.arg), '__name__',
+                                       None)
+            if (
+                check.opname not in ('LOAD_GLOBAL', 'LOAD_COMMON_CONSTANT')
+                or checked_name != 'tuple'
+                or identity.opname != 'IS_OP'
+                or identity.arg != 0
+                or branch.opname not in ('POP_JUMP_IF_FALSE',
+                                          'POP_JUMP_FORWARD_IF_FALSE')
+            ):
+                continue
+            fallback = by_offset.get(int(branch.argval or 0))
+            if fallback is None:
+                continue
+            function = fallback + (raw_list[fallback].opname == 'PUSH_NULL')
+            if function + 2 >= len(raw_list):
+                continue
+            if not (
+                raw_list[function].opname == 'LOAD_CONST'
+                and hasattr(raw_list[function].argval, 'co_code')
+                and raw_list[function].argval.co_name == '<genexpr>'
+                and raw_list[function + 1].opname in ('LOAD_CONST', 'MAKE_FUNCTION')
+                and (
+                    raw_list[function + 1].opname == 'MAKE_FUNCTION'
+                    or raw_list[function + 1].argval == '<genexpr>'
+                )
+                and (
+                    raw_list[function + 1].opname == 'MAKE_FUNCTION'
+                    or raw_list[function + 2].opname == 'MAKE_FUNCTION'
+                )
+            ):
+                continue
+            fast_path = raw_list[index + 5:fallback]
+            if not any(ins.opname in ('LIST_APPEND', 'LIST_EXTEND')
+                       for ins in fast_path):
+                continue
+            if not any(ins.opname in ('LIST_TO_TUPLE', 'CALL_INTRINSIC_1')
+                       for ins in fast_path):
+                continue
+            for ins in raw_list[index + 1:fallback]:
+                self._drops.add(ins.offset)
+
     def _mark_restores(self, raw_list, index, borrowed):
         """Flag the bookkeeping that puts the borrowed locals back.
 
@@ -770,6 +837,9 @@ class Rewriter(object):
                 if target >= entry.target:
                     # Already leaves the handler; nothing to re-aim.
                     break
+                if target < entry.end:
+                    # This is a real loop continue, not a duplicated tail.
+                    break
                 # The code the handler jumps back to is the code that follows
                 # the whole ``try`` statement.  3.11/3.12 place it before the
                 # handler, where the reader would take it for the ``else``
@@ -779,6 +849,64 @@ class Rewriter(object):
                 self._retarget[raw.offset] = merge
                 self._save_tail_for_merge(target, merge)
                 break
+
+    def _analyse_exception_loop_exits(self):
+        """Restore ``break`` markers optimized away before an out-of-line handler.
+
+        A ``while True`` with a ``break`` as the last statement in a protected
+        body can end in a source-line ``NOP``. Its except handler is laid out
+        after the function body and jumps back to the loop head. Restore both
+        the dropped-NOP loop target and the normal-path exit jump.
+        """
+        raw_list = self.raw
+        by_offset = {raw.offset: index for index, raw in enumerate(raw_list)}
+        jump_ops = set(dis.hasjabs) | set(dis.hasjrel)
+        for entry in _exception_entries(self.code):
+            handler = by_offset.get(entry.target)
+            head = by_offset.get(entry.start)
+            end = by_offset.get(entry.end)
+            if handler is None or head is None or end is None:
+                continue
+            loop_heads = set()
+            for raw in raw_list[handler:]:
+                if raw.opname == 'RERAISE':
+                    break
+                if raw.opcode in jump_ops and isinstance(raw.argval, int) \
+                        and raw.argval < entry.start:
+                    target = by_offset.get(raw.argval)
+                    if target is not None and raw_list[target].opname == 'NOP':
+                        loop_heads.add(raw.argval)
+            if not loop_heads or raw_list[end].opname != 'NOP':
+                continue
+            exit_index = end + 1
+            while exit_index < len(raw_list) and (
+                    raw_list[exit_index].opname == 'NOP'
+                    or raw_list[exit_index].opname in DROPPED):
+                exit_index += 1
+            if exit_index >= len(raw_list):
+                continue
+            has_normal_back_edge = any(
+                raw.opcode in jump_ops and isinstance(raw.argval, int)
+                and raw.argval in loop_heads
+                for raw in raw_list[end + 1:handler]
+            )
+            if has_normal_back_edge:
+                continue
+            self._loop_breaks = getattr(self, '_loop_breaks', {})
+            self._loop_breaks[raw_list[end].offset] = raw_list[exit_index].offset
+            loop_head = min(loop_heads)
+            target_index = by_offset[loop_head]
+            while target_index < len(raw_list) and (
+                    raw_list[target_index].opname == 'NOP'
+                    or raw_list[target_index].opname in DROPPED):
+                target_index += 1
+            if target_index >= len(raw_list):
+                continue
+            target_offset = raw_list[target_index].offset
+            self.jump_targets.add(target_offset)
+            for raw in raw_list[handler:]:
+                if raw.opcode in jump_ops and raw.argval == loop_head:
+                    self._retarget[raw.offset] = target_offset
 
     def _save_tail_for_merge(self, tail_start, merge_offset):
         """Save tail instructions to be emitted at the merge point.
@@ -1694,13 +1822,59 @@ class Rewriter(object):
                                                      raw_list[dispatch].offset,
                                                      body)
                         if cleanup is not None:
-                            tail.append(('SETUP_FINALLY', None, cleanup))
                             body_end = self._name_body_end(entries, body)
+                            loop_cleanup = False
+                            if body_end is not None:
+                                body_entry = next(
+                                    entry for entry in entries
+                                    if entry.start == body.offset and entry.lasti
+                                )
+                                cleanup_index = by_offset.get(body_entry.end)
+                                if cleanup_index is not None:
+                                    if raw_list[cleanup_index].opname == 'POP_EXCEPT':
+                                        cleanup_index += 1
+                                    if (
+                                        cleanup_index + 3 < len(raw_list)
+                                        and raw_list[cleanup_index].opname == 'LOAD_CONST'
+                                        and raw_list[cleanup_index].argval is None
+                                        and raw_list[cleanup_index + 1].opname in _STORE_OPS
+                                        and raw_list[cleanup_index + 1].argval == bound.argval
+                                        and raw_list[cleanup_index + 2].opname == 'DELETE_FAST'
+                                        and raw_list[cleanup_index + 2].argval == bound.argval
+                                        and raw_list[cleanup_index + 3].opname in _JUMP_OPS
+                                        and isinstance(raw_list[cleanup_index + 3].argval, int)
+                                        and raw_list[cleanup_index + 3].argval < body.offset
+                                    ):
+                                        loop_cleanup = True
+                                        self._drops.update(
+                                            raw_list[k].offset
+                                            for k in range(cleanup_index,
+                                                           cleanup_index + 3)
+                                        )
+                                        cleanup_handler = by_offset.get(cleanup)
+                                        if cleanup_handler is not None and (
+                                            cleanup_handler + 3 < len(raw_list)
+                                            and raw_list[cleanup_handler].opname == 'LOAD_CONST'
+                                            and raw_list[cleanup_handler].argval is None
+                                            and raw_list[cleanup_handler + 1].opname in _STORE_OPS
+                                            and raw_list[cleanup_handler + 1].argval == bound.argval
+                                            and raw_list[cleanup_handler + 2].opname == 'DELETE_FAST'
+                                            and raw_list[cleanup_handler + 2].argval == bound.argval
+                                            and raw_list[cleanup_handler + 3].opname == 'RERAISE'
+                                        ):
+                                            self._drops.update(
+                                                raw_list[k].offset
+                                                for k in range(cleanup_handler,
+                                                               cleanup_handler + 4)
+                                            )
+                            if not loop_cleanup:
+                                tail.append(('SETUP_FINALLY', None, cleanup))
                             if body_end is None:
                                 # An empty handler body closes the implicit
                                 # block straight away.
-                                tail.append(('POP_BLOCK', None, None))
-                            else:
+                                if not loop_cleanup:
+                                    tail.append(('POP_BLOCK', None, None))
+                            elif not loop_cleanup:
                                 self.name_closes[body_end] = cleanup
                         before[body.offset] = tail
                 else:
@@ -2102,6 +2276,18 @@ class Rewriter(object):
         raw_list = self.raw
         raw = raw_list[index]
         opname = raw.opname
+        loop_exit = getattr(self, '_loop_breaks', {}).get(raw.offset)
+        if loop_exit is not None:
+            out.append(self._make(raw, 'JUMP_ABSOLUTE', loop_exit, loop_exit,
+                                  synthetic_loop_exit=True))
+            return index + 1
+        if raw.offset in self.try_setups:
+            for target in self.try_setups[raw.offset]:
+                out.append(self._make(raw, 'SETUP_FINALLY', raw.offset,
+                                      target, line_no=None))
+                if (raw.offset, target) in self.empty_body_setups:
+                    out.append(self._make(raw, 'POP_BLOCK', None, None,
+                                          line_no=None))
         if index in runs:
             return self._emit_store_run(index, runs[index], out)
         if opname == 'COPY':
@@ -2253,15 +2439,6 @@ class Rewriter(object):
                 raw.arg >> 2, raw.argval,
             ))
             return index + 1
-        if raw.offset in self.try_setups:
-            for target in self.try_setups[raw.offset]:
-                out.append(self._make(raw, 'SETUP_FINALLY', raw.offset,
-                                      target, line_no=None))
-                if (raw.offset, target) in self.empty_body_setups:
-                    # The inner ``try`` body is empty, so 3.9 closed it with a
-                    # ``POP_BLOCK`` right after the ``SETUP_FINALLY``.
-                    out.append(self._make(raw, 'POP_BLOCK', None, None,
-                                          line_no=None))
         if raw.offset in self.with_closes:
             # 3.9 closed the ``with`` block right before the implicit
             # ``__exit__`` call, so the close goes in front of the operands the
@@ -2472,7 +2649,8 @@ class Rewriter(object):
             index = end
         return runs
 
-    def _make(self, raw, opname, arg, argval, line_no=None):
+    def _make(self, raw, opname, arg, argval, line_no=None,
+              synthetic_loop_exit=False):
         """Build one 3.9 :class:`Instruction` standing in for *raw*."""
         if line_no is None:
             line_no = raw.starts_line
@@ -2485,6 +2663,7 @@ class Rewriter(object):
             argrepr=_repr_of(opname, arg, argval),
             line_no=line_no,
             is_jump_target=raw.offset in self.jump_targets,
+            synthetic_loop_exit=synthetic_loop_exit,
         )
 
 
@@ -2649,4 +2828,3 @@ class Decompiler311(Decompiler310):
 
 def make_decompiler():
     return Decompiler311()
-

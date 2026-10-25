@@ -30,7 +30,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from tests.cases import PROBES
 
-# 3.13 / 3.14 still carry a few provably printer-only differences: the
+# 3.13 / 3.14 / 3.15 still carry a few provably printer-only differences: the
 # ``ast.unparse`` that ships with 3.11+ drops the redundant parentheses around
 # parenthesised sub-expressions, so a source such as ``(a) and b`` comes back
 # as ``a and b`` -- identical, but not text-equal.  These are not defects and
@@ -68,7 +68,9 @@ def _folder_for(version: str):
     root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
     if root not in sys.path:
         sys.path.insert(0, root)
-    return importlib.import_module("py%sDecompiler" % version.replace(".", ""))
+    package = "Py315Decompiler" if version == "3.15" else (
+        "py%sDecompiler" % version.replace(".", ""))
+    return importlib.import_module(package)
 
 
 def _running_version() -> str:
@@ -85,9 +87,14 @@ def _check_folder(version: str) -> List[Tuple[str, bool, str]]:
 
     rows.append(("import", module.VERSION == version,
                  "VERSION=%r" % getattr(module, "VERSION", None)))
+    if version == "3.15":
+        parser = importlib.import_module("Py315Decompiler.pyc_parser").PyCParser
+        rows.append(("pyc magic", parser.get_python_version(0x0E52) == version,
+                     "magic=0x0e52 -> %s"
+                     % parser.get_python_version(0x0E52)))
 
     allow = (KNOWN_EQUIVALENT_313 if version == "3.13"
-             else KNOWN_EQUIVALENT_314 if version == "3.14" else set())
+             else KNOWN_EQUIVALENT_314 if version in ("3.14", "3.15") else set())
 
     parse_ok = 0
     failures = 0
@@ -146,8 +153,13 @@ def _worker_main(payload: str):
     rows: List[Tuple[str, bool, str]] = []
     rows.append(("import", module.VERSION == version,
                  "VERSION=%r" % getattr(module, "VERSION", None)))
+    if version == "3.15":
+        parser = importlib.import_module("Py315Decompiler.pyc_parser").PyCParser
+        rows.append(("pyc magic", parser.get_python_version(0x0E52) == version,
+                     "magic=0x0e52 -> %s"
+                     % parser.get_python_version(0x0E52)))
     allow = (KNOWN_EQUIVALENT_313 if version == "3.13"
-             else KNOWN_EQUIVALENT_314 if version == "3.14" else set())
+             else KNOWN_EQUIVALENT_314 if version in ("3.14", "3.15") else set())
     parse_ok = 0
     failures = 0
     for name, source in request["probes"].items():
@@ -171,7 +183,7 @@ def _worker_main(payload: str):
 def _all_versions() -> List[str]:
     root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
     versions = []
-    for ver in ("3.9", "3.10", "3.11", "3.12", "3.13", "3.14"):
+    for ver in ("3.9", "3.10", "3.11", "3.12", "3.13", "3.14", "3.15"):
         interp = os.path.join(root, "embed_python", "python-" + ver, "python.exe")
         if os.path.isfile(interp):
             versions.append(ver)

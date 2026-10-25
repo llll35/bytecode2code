@@ -1,11 +1,12 @@
 """Unified entry point for the bytecode2code decompiler (new framework only).
 
 No dependency on the archived `pyvers` / `bytecode2code` framework.
-The self-contained version folders (`py39Decompiler` ... `py314Decompiler`)
+The self-contained version folders (`py39Decompiler` ... `Py315Decompiler`)
 are the only decompilers used.
 """
 
 import os
+import subprocess
 import sys
 
 _ROOT = os.path.dirname(os.path.abspath(__file__))
@@ -36,7 +37,7 @@ def _cmd_demo(args):
         '        return "medium"',
         '    return "small"',
     ])
-    versions = ("3.9", "3.10", "3.11", "3.12", "3.13", "3.14")
+    versions = ("3.9", "3.10", "3.11", "3.12", "3.13", "3.14", "3.15")
     print("=" * 64)
     print("BYTECODE2CODE CROSS VERSION DEMO (new framework)")
     print("=" * 64)
@@ -49,22 +50,34 @@ def _cmd_demo(args):
                 continue
             target = os.path.join(folder, version + ".pyc")
             # compile with embedded interpreter
-            import py_compile
             src_path = os.path.join(folder, version + ".py")
             with open(src_path, "w", encoding="utf-8") as f:
                 f.write(sample)
-            py_compile.compile(src_path, cfile=target, doraise=True)
-            # decompile with matching folder
-            import importlib
-            mod = importlib.import_module("py%sDecompiler" % version.replace(".", ""))
-            data = mod.decompile(open(target, "rb"))
-            # Actually decompile needs code object, not file path; use parser
-            from tests import cases
-            from tests.equivalence import version_of
-            import importlib
-            parser_mod = importlib.import_module("py%sDecompiler.pyc_parser" % version.replace(".", ""))
-            parsed = parser_mod.PyCParser.parse_file(target)
-            rebuilt = mod.decompile(parsed.code)
+            subprocess.run(
+                [py, "-c",
+                 "import py_compile,sys; "
+                 "py_compile.compile(sys.argv[1], cfile=sys.argv[2], doraise=True)",
+                 src_path, target],
+                check=True,
+            )
+            # Parse and decompile in the matching interpreter: marshal data
+            # cannot be read by a different Python version.
+            script = (
+                "import importlib,sys; "
+                "root,path=sys.argv[1:]; sys.path.insert(0,root); "
+                "v='%d.%d' % sys.version_info[:2]; "
+                "p='Py315Decompiler' if v=='3.15' else "
+                "'py%sDecompiler' % v.replace('.',''); "
+                "parser=importlib.import_module(p+'.pyc_parser'); "
+                "code=parser.PyCParser.parse_file(path).code; "
+                "print(importlib.import_module(p).decompile(code))"
+            )
+            completed = subprocess.run(
+                [py, "-I", "-c", script, _ROOT, target],
+                capture_output=True, text=True, encoding="utf-8",
+                check=True,
+            )
+            rebuilt = completed.stdout
             print("  %s -> %d chars" % (version, len(rebuilt)))
             results.append((version, rebuilt))
     print()
@@ -95,10 +108,11 @@ def main(argv=None):
     if cmd == "demo":
         return _cmd_demo(rest)
     if cmd == "versions":
-        print("supported versions (folders):")
-        versions = ("3.9", "3.10", "3.11", "3.12", "3.13", "3.14")
+        print("supported versions:")
+        versions = ("3.9", "3.10", "3.11", "3.12", "3.13", "3.14", "3.15")
         for v in versions:
-            folder = "py%sDecompiler" % v.replace(".", "")
+            folder = ("Py315Decompiler" if v == "3.15"
+                      else "py%sDecompiler" % v.replace(".", ""))
             exists = os.path.isdir(folder)
             print("  %-6s %s" % (v, "present" if exists else "MISSING"))
         return 0
@@ -110,6 +124,27 @@ def main(argv=None):
         if not target:
             print("usage: decompile <file.pyc>")
             return 2
+        with open(target, "rb") as handle:
+            magic = int.from_bytes(handle.read(2), "little")
+        if magic == 0x0E52:
+            interpreter = os.path.join(
+                _ROOT, "embed_python", "python-3.15", "python.exe")
+            if not os.path.isfile(interpreter):
+                sys.stderr.write(
+                    "Python 3.15 bytecode requires embed_python/python-3.15/python.exe\n"
+                )
+                return 1
+            worker = os.path.join(_ROOT, "Py315Decompiler", "worker.py")
+            completed = subprocess.run(
+                [interpreter, "-I", worker, os.path.abspath(target)],
+                capture_output=True, text=True, encoding="utf-8",
+                cwd=_ROOT,
+            )
+            if completed.returncode:
+                sys.stderr.write(completed.stderr)
+                return completed.returncode
+            sys.stdout.write(completed.stdout)
+            return 0
         parsed = importlib.import_module("py39Decompiler.pyc_parser").PyCParser.parse_file(target)
         version = parsed.python_version
         folder = "py%sDecompiler" % version.replace(".", "")

@@ -7,9 +7,9 @@ python main.py decompile module.pyc
 ```
 
 `bytecode2code` reads the bytecode of a compiled module and reconstructs the
-Python that produced it. It works on every CPython from 3.9 through 3.14, and
+Python that produced it. It reads CPython 3.9 through 3.15 bytecode, and
 decompiles 3.9 - 3.12 fully (3.13 and 3.14 fall back to a normalised
-disassembly).
+disassembly; 3.15 has its own decompiler backend).
 
 ## Why two front ends
 
@@ -32,10 +32,10 @@ python -m bytecode2code decompile m.pyc    # same thing, running interpreter onl
 
 ### Getting the interpreters
 
-`embed_python/` is **not** tracked in git -- the six CPython builds are ~313 MB.
+`embed_python/` is **not** tracked in git -- the seven CPython builds are ~313 MB.
 `pyvers` looks for `embed_python/python-X.Y/python.exe`; populate it by
 downloading the official embeddable builds from
-<https://www.python.org/downloads/windows/> (3.9 - 3.14) and extracting each
+<https://www.python.org/downloads/windows/> (3.9 - 3.15) and extracting each
 into a folder named after its version:
 
 ```
@@ -99,6 +99,7 @@ pyvers/                 the cross-version layer
 
 tests/                  round-trip and source-fidelity tests
 embed_python/           the CPython interpreters used by pyvers
+Py315Decompiler/        the self-contained Python 3.15 backend
 ```
 
 ## How the reconstruction works
@@ -143,7 +144,8 @@ are known to be imperfect; each is covered by a test or an allow-list in
   leaves a `try` body is not yet recovered on every version, and a `return`
   inside a `try`/`finally` is only recovered when the body is otherwise empty.
 * **3.13/3.14.** Only a normalised disassembly is produced; there is no full
-  decompiler for these versions yet.
+  decompiler for these versions yet. Python 3.15 uses the `Py315Decompiler`
+  backend; its coverage is still evolving.
 * **Stringified annotations.** `from __future__ import annotations` stores
   annotations as source text, which is recovered by re-parsing.
 * **Unreachable code.** Statements the compiler proved dead are not in the
