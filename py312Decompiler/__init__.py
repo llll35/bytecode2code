@@ -1,8 +1,11 @@
-# Python 3.12 Decompiler
-# Includes 3.12 differences: comprehensions inlined, super() opcode,
-# short-circuit operators duplicated, exception handler backward jumps.
-import ast
+"""Self-contained Python 3.12 decompiler."""
+from .decompiler import Decompiler
+from .decomp_compat import Decompiler310, make_decompiler
+from .decomp311 import Decompiler311
 
-class Decompiler:
-    """3.12-specific decompilation shapes."""
-    pass
+VERSION = "3.12"
+
+__all__ = ["Decompiler", "VERSION", "Decompiler310", "Decompiler311", "decompile", "make_decompiler"]
+
+def decompile(code):
+    return make_decompiler(VERSION).decompile(code)

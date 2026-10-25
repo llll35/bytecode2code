@@ -14,7 +14,7 @@ without touching the original package.
 import ast
 from typing import Any, List, Optional, Tuple
 
-from bytecode2code import Decompiler as _BaseDecompiler
+from .decompiler import Decompiler as _BaseDecompiler
 
 _JUMP_OPS = ("JUMP_ABSOLUTE", "JUMP_FORWARD")
 _POP_JUMPS = ("POP_JUMP_IF_FALSE", "POP_JUMP_IF_TRUE")
@@ -325,7 +325,7 @@ class Decompiler310(_BaseDecompiler):
         it.  Both layouts have to be swapped back so the callable is the one
         the comprehension object replaced.
         """
-        from bytecode2code.decompiler import _CompMaker
+        from .decompiler import _CompMaker
         if opname != "CALL_FUNCTION":
             return super()._process_call(opname, instr, stack, stmts)
         argc = instr.arg or 0

@@ -27,8 +27,8 @@ syntactic; the decompiler keeps doing all the work.
 import dis
 import sys
 import ast
-from bytecode2code import Instruction
-from bytecode2code.decompiler import _is_bare_return
+from .disassembler import Instruction
+from .decompiler import _is_bare_return
 
 from .decomp_compat import Decompiler310
 
