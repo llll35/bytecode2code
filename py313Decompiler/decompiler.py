@@ -480,17 +480,6 @@ class Decompiler:
         consts = getattr(func_code, "co_consts", ())
         if not consts or not isinstance(consts[0], str):
             return stmts
-        # 3.14 dropped the ``None`` placeholder that used to keep a real
-        # constant out of ``co_consts[0]``, so the slot alone no longer means
-        # "docstring": ``def f(a): return f'{a}>x'`` parks ``'>'`` there.  A
-        # docstring is the one constant that is never loaded, so a load of the
-        # same value rules it out.
-        if any(
-            getattr(ins, "opname", "").startswith("LOAD")
-            and getattr(ins, "argval", None) == consts[0]
-            for ins in instrs
-        ):
-            return stmts
         if (
             len(instrs) >= 2
             and instrs[0].opname == "LOAD_NAME"
@@ -1360,9 +1349,6 @@ class Decompiler:
         n = len(instructions) if end is None else end
         total = len(instructions)
         while i < n:
-            if any(r_start <= i < r_end for r_start, r_end in self._handled_ranges):
-                i += 1
-                continue
             # ``while cond:`` -- the head is the condition, guarded by POP_JUMP_IF_*.
             # This must be tried before ``while True`` because the body of a
             # ``while True`` may also contain jumps back to its own head.
@@ -1379,21 +1365,13 @@ class Decompiler:
             back_edge = self._find_while_true_back_edge(instructions, i, n)
             if back_edge is not None:
                 loop_end = self._compute_loop_end(instructions, i, back_edge)
-                synthetic_exits = [
-                    self._find_target_idx(instructions, self._jump_target(ins))
-                    for ins in instructions[i:back_edge]
-                    if getattr(ins, "synthetic_loop_exit", False)
-                ]
-                if synthetic_exits:
-                    loop_end = min(synthetic_exits)
                 exit_offset = (
                     instructions[loop_end].offset
                     if loop_end < total
                     else instructions[-1].offset + 2
                 )
                 body_stmts = self._emit_loop_body(
-                    code, instructions, i, min(back_edge, loop_end),
-                    instructions[i].offset, exit_offset,
+                    code, instructions, i, back_edge, instructions[i].offset, exit_offset,
                 )
                 stmts.append(
                     ast.While(test=ast.Constant(value=True), body=body_stmts, orelse=[])
@@ -1411,6 +1389,15 @@ class Decompiler:
                 if skip:
                     i += 1
                     continue
+            # Skip instructions already consumed by an enclosing control-flow construct
+            already_handled = False
+            for r_start, r_end in self._handled_ranges:
+                if r_start <= i < r_end:
+                    already_handled = True
+                    break
+            if already_handled:
+                i += 1
+                continue
             instr = instructions[i]
             chain_consumed = self._try_emit_chain_cond(
                 code, instructions, i, n, stack, stmts
@@ -1443,8 +1430,7 @@ class Decompiler:
                 i += ifexp_consumed
                 continue
             # Implicit `return None` tail of a function body.
-            if (i + 1 == total - 1 and instr.opname == "LOAD_CONST"
-                    and instr.argval is None and not instr.is_jump_target):
+            if i + 1 == total - 1 and instr.opname == "LOAD_CONST" and instr.argval is None:
                 next_instr = instructions[i + 1] if i + 1 < total else None
                 if next_instr and next_instr.opname == "RETURN_VALUE":
                     break
@@ -1587,11 +1573,7 @@ class Decompiler:
         )
         return end - idx
 
-    _CLASS_ARTIFACT_NAMES = (
-        "__module__", "__qualname__", "__classcell__",
-        "__firstlineno__", "__static_attributes__",
-        "__annotate_func__", "__classdict__", "__classdictcell__",
-    )
+    _CLASS_ARTIFACT_NAMES = ("__module__", "__qualname__", "__classcell__")
 
     def _strip_class_artifacts(self, stmts: List[ast.stmt]) -> List[ast.stmt]:
         """Drop the bookkeeping assignments CPython injects into a class body.
@@ -2126,7 +2108,6 @@ class Decompiler:
                                 for t in range(clause_len)] != handler_copy:
                             continue
                         self._handled_ranges.append((j + 1, k))
-            deferred_else: List[ast.stmt] = []
             try_stack: List[ast.expr] = []
             try_body = self._emit_statements(
                 code, instructions, is_module=False, start=instr_start + 1, end=try_end_idx,
@@ -2215,7 +2196,7 @@ class Decompiler:
                     start=try_end_idx + 1, end=_return_idx + 1,
                     out_stack=[],
                 )
-                deferred_else = tail
+                try_body.extend(tail)
             # A ``return`` as the last statement of a try body compiles to
             # ``POP_BLOCK`` + (optional loop-teardown pair) + ``RETURN_VALUE``;
             # the returned value is still on the virtual stack when the body
@@ -2250,7 +2231,6 @@ class Decompiler:
                                                   handler_start_idx, try_end_idx)
             if parsed is None or self._is_bare_finally(instructions,
                                                        handler_start_idx):
-                try_body.extend(deferred_else)
                 # ``SETUP_FINALLY`` whose handler only re-raises is a
                 # ``try``/``finally``: the clause was emitted inline where the
                 # protected range ends, and the handler runs a second copy of it
@@ -2324,33 +2304,7 @@ class Decompiler:
                             skip_to = resume + 2
             else:
                 handlers, orelse, post = parsed
-                orelse = deferred_else + orelse
-                tail_jump = (
-                    instructions[try_end_idx + 1]
-                    if try_end_idx + 1 < len(instructions)
-                    and instructions[try_end_idx + 1].opname in (
-                        "JUMP_FORWARD", "JUMP_ABSOLUTE",
-                    )
-                    else None
-                )
-                loop_backedge = (
-                    tail_jump is not None
-                    and self._jump_target(tail_jump) <= instructions[try_end_idx].offset
-                )
-                external_loop_handler = (
-                    limit is not None
-                    and handler_start_idx >= limit
-                    and (
-                        any(isinstance(stmt, ast.Break) for stmt in try_body)
-                        or loop_backedge
-                    )
-                )
-                if external_loop_handler:
-                    orelse = []
-                    self._handled_ranges.append((
-                        handler_start_idx, min(len(instructions), post + 1)
-                    ))
-                if not orelse and not external_loop_handler:
+                if not orelse:
                     orelse = self._recover_else_clause(
                         code, instructions, try_end_idx, handler_start_idx, post)
                 skip_to = post
@@ -2953,11 +2907,7 @@ class Decompiler:
                 stack.append(_CompMaker(func_code.value))
                 return 1
             fn = self._decompile_function(func_code.value, func_name)
-            holder = _FuncDefHolder(fn, annotations=annotations, defaults=pos_defaults, kw_defaults=kw_defaults, closure=closure)
-            if func_name in ("lambda", "<lambda>") or getattr(func_code.value, "co_name", None) == "<lambda>":
-                stack.append(self._holder_to_expr(holder))
-            else:
-                stack.append(holder)
+            stack.append(_FuncDefHolder(fn, annotations=annotations, defaults=pos_defaults, kw_defaults=kw_defaults, closure=closure))
             return 1
         stack.append(ast.Name(id=f"<function {func_name}>", ctx=ast.Load()))
         return 1
@@ -6097,6 +6047,19 @@ class Decompiler:
             return f"{ind}pass"
         if isinstance(stmt, ast.Expr):
             return f"{ind}{self._expr_to_str(stmt.value)}"
+        # Suppress redundant assignments produced by submodule imports
+        # (e.g. \import os.path\ already binds \os\; \os = os.path\
+        # is a compiler artifact with no source-level meaning).
+        if isinstance(stmt, ast.Assign) and len(stmt.targets) == 1:
+            target_name = None
+            if isinstance(stmt.targets[0], ast.Name):
+                target_name = stmt.targets[0].id
+            if isinstance(stmt.value, ast.Name) and stmt.value.id == target_name:
+                return None
+            # Submodule import artifact: `os = os.path` (value is Attribute)
+            if isinstance(stmt.value, ast.Attribute) and isinstance(stmt.value.value, ast.Name):
+                if stmt.value.value.id == target_name:
+                    return None
         if isinstance(stmt, ast.Assign):
             tgts = ", ".join(self._expr_to_str(t) for t in stmt.targets)
             return f"{ind}{tgts} = {self._expr_to_str(stmt.value)}"
