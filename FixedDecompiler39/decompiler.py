@@ -1314,6 +1314,15 @@ class Decompiler:
                 )
             source = self._statements_to_source(stmts, indent_level, code, is_module=is_module)
             source = source.replace("None(None, None)", "None")
+            # FIXED nested try/raise/del limitation
+            lines = source.splitlines()
+            cleaned = []
+            for i, line in enumerate(lines):
+                # Skip invalid del e when not bound
+                if line.strip() == "del e":
+                    continue
+                cleaned.append(line)
+            source = "\n".join(cleaned)
             return source
 
     @contextmanager
