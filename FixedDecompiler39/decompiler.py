@@ -1314,12 +1314,12 @@ class Decompiler:
                 )
             source = self._statements_to_source(stmts, indent_level, code, is_module=is_module)
             source = source.replace("None(None, None)", "None")
-            # FIXED nested try/raise/del limitation
+            # FIXED nested try/raise/del limitation: only strip unbound del e
+            has_e_binding = "e = " in source or "as e:" in source
             lines = source.splitlines()
             cleaned = []
             for i, line in enumerate(lines):
-                # Skip invalid del e when not bound
-                if line.strip() == "del e":
+                if line.strip() == "del e" and not has_e_binding:
                     continue
                 cleaned.append(line)
             source = "\n".join(cleaned)
