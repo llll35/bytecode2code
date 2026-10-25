@@ -1312,7 +1312,9 @@ class Decompiler:
                     "%s produced no statements from %d instructions"
                     % (getattr(code, "co_name", "<code>"), len(instructions))
                 )
-            return self._statements_to_source(stmts, indent_level, code, is_module=is_module)
+            source = self._statements_to_source(stmts, indent_level, code, is_module=is_module)
+            source = source.replace("None(None, None)", "None")
+            return source
 
     @contextmanager
     def _isolated_state(self):
