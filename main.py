@@ -116,7 +116,10 @@ def _cmd_dis(args):
     if not target or not os.path.isfile(target):
         print("usage: dis <file.pyc>")
         return 2
-    parsed = importlib.import_module("py39Decompiler.pyc_parser").PyCParser.parse_file(target)
+    from tests.equivalence import version_of
+    version = version_of(target) or "3.9"
+    parser_folder = "py%sDecompiler.pyc_parser" % version.replace(".", "")
+    parsed = importlib.import_module(parser_folder).PyCParser.parse_file(target)
     dis.dis(parsed.code)
     return 0
 
@@ -168,12 +171,17 @@ def _cmd_ir(args):
     if not target or not os.path.isfile(target):
         print("usage: ir <file.pyc>")
         return 2
-    parsed = importlib.import_module("py39Decompiler.pyc_parser").PyCParser.parse_file(target)
+    from tests.equivalence import version_of
+    version = version_of(target)
+    parser_folder = "py%sDecompiler.pyc_parser" % version.replace(".", "") if version else "py39Decompiler.pyc_parser"
+    parsed = importlib.import_module(parser_folder).PyCParser.parse_file(target)
     folder = "py%sDecompiler" % parsed.python_version.replace(".", "")
+    if not os.path.isdir(folder):
+        print("no decompiler folder for %s" % parsed.python_version)
+        return 1
     mod = importlib.import_module(folder)
     import json
     instrs = mod.decompile(parsed.code)
-    # Simple pseudo-output: just show decompiled source as skeleton
     print(instrs)
     return 0
 
@@ -184,7 +192,10 @@ def _cmd_header(args):
     if not target or not os.path.isfile(target):
         print("usage: header <file.pyc>")
         return 2
-    parsed = importlib.import_module("py39Decompiler.pyc_parser").PyCParser.parse_file(target)
+    from tests.equivalence import version_of
+    version = version_of(target) or "3.9"
+    parser_folder = "py%sDecompiler.pyc_parser" % version.replace(".", "")
+    parsed = importlib.import_module(parser_folder).PyCParser.parse_file(target)
     print("version:", parsed.python_version)
     print("magic:", hex(parsed.magic))
     print("timestamp:", parsed.timestamp)
