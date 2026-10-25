@@ -64,6 +64,10 @@ KNOWN_EQUIVALENT_314 = {
 
 
 def _folder_for(version: str):
+    # Ensure the workspace root is on sys.path for embedded interpreter workers.
+    root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    if root not in sys.path:
+        sys.path.insert(0, root)
     return importlib.import_module("py%sDecompiler" % version.replace(".", ""))
 
 
