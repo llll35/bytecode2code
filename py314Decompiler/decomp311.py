@@ -413,7 +413,7 @@ class Rewriter(object):
         self.code = code
         self.version = sys.version_info[:2]
         self.raw = self._normalise_raw(
-            list(dis.get_instructions(code, show_caches=False)))
+            list(dis.get_instructions(code)))
         # 3.11 kept a dedicated ``LOAD_METHOD``; 3.12 dropped it and shifted the
         # ``LOAD_ATTR`` name index left by one, leaving bit 0 as the method flag.
         self.attr_method_bit = None if self.version == (3, 11) else 0

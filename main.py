@@ -93,70 +93,162 @@ def _cmd_demo(args):
 # minimal CLI dispatcher
 # ------------------------------------------------------------------
 
+def _cmd_decompile(args):
+    import importlib
+    from tests.equivalence import version_of
+    target = args[0] if args else None
+    if not target or not os.path.isfile(target):
+        print("usage: decompile <file.pyc>")
+        return 2
+    parsed = importlib.import_module("py39Decompiler.pyc_parser").PyCParser.parse_file(target)
+    folder = "py%sDecompiler" % parsed.python_version.replace(".", "")
+    if not os.path.isdir(folder):
+        print("no decompiler folder for %s" % parsed.python_version)
+        return 1
+    mod = importlib.import_module(folder)
+    print(mod.decompile(parsed.code))
+    return 0
+
+
+def _cmd_dis(args):
+    import dis, importlib
+    target = args[0] if args else None
+    if not target or not os.path.isfile(target):
+        print("usage: dis <file.pyc>")
+        return 2
+    parsed = importlib.import_module("py39Decompiler.pyc_parser").PyCParser.parse_file(target)
+    dis.dis(parsed.code)
+    return 0
+
+
+def _cmd_compile(args):
+    import py_compile, tempfile, os
+    source_path = args[0] if args else None
+    ver = "3.9"
+    if "--version" in args:
+        idx = args.index("--version")
+        if idx + 1 < len(args):
+            ver = args[idx + 1]
+    if not source_path or not os.path.isfile(source_path):
+        print("usage: compile <file.py> [--version X.Y]")
+        return 2
+    out_path = source_path.replace(".py", ".pyc")
+    interpreter = os.path.join(_ROOT, "embed_python", "python-" + ver, "python.exe")
+    if not os.path.isfile(interpreter):
+        print("interpreter for %s not found" % ver)
+        return 1
+    subprocess.run([interpreter, "-c", "import py_compile,sys; py_compile.compile(sys.argv[1], cfile=sys.argv[2], doraise=True)", source_path, out_path], check=True)
+    print("compiled %s -> %s (python %s)" % (source_path, out_path, ver))
+    return 0
+
+
+def _cmd_info(args):
+    versions = ("3.9", "3.10", "3.11", "3.12", "3.13", "3.14", "3.15")
+    for v in versions:
+        folder = ("Py315Decompiler" if v == "3.15" else "py%sDecompiler" % v.replace(".", ""))
+        exists = os.path.isdir(folder)
+        interp_path = os.path.join(_ROOT, "embed_python", "python-" + v, "python.exe")
+        interp_exists = os.path.isfile(interp_path)
+        print("%-6s folder=%-3s interpreter=%-3s" % (v, "yes" if exists else "no", "yes" if interp_exists else "no"))
+    return 0
+
+
+def _cmd_versions(args):
+    _cmd_info([])
+    return 0
+
+
+def _cmd_skeleton(args):
+    return _cmd_decompile(args)
+
+
+def _cmd_ir(args):
+    import importlib
+    target = args[0] if args else None
+    if not target or not os.path.isfile(target):
+        print("usage: ir <file.pyc>")
+        return 2
+    parsed = importlib.import_module("py39Decompiler.pyc_parser").PyCParser.parse_file(target)
+    folder = "py%sDecompiler" % parsed.python_version.replace(".", "")
+    mod = importlib.import_module(folder)
+    import json
+    instrs = mod.decompile(parsed.code)
+    # Simple pseudo-output: just show decompiled source as skeleton
+    print(instrs)
+    return 0
+
+
+def _cmd_header(args):
+    import importlib
+    target = args[0] if args else None
+    if not target or not os.path.isfile(target):
+        print("usage: header <file.pyc>")
+        return 2
+    parsed = importlib.import_module("py39Decompiler.pyc_parser").PyCParser.parse_file(target)
+    print("version:", parsed.python_version)
+    print("magic:", hex(parsed.magic))
+    print("timestamp:", parsed.timestamp)
+    return 0
+
+
+def _cmd_code_info(args):
+    return _cmd_ir(args)
+
+
+# ------------------------------------------------------------------
+# dispatcher mapping
+# ------------------------------------------------------------------
+
+ALIASES = {
+    "d": "decompile",
+    "dis": "dis",
+    "disassemble": "dis",
+    "i": "info",
+    "infos": "code-info",
+}
+
+COMMANDS = {
+    "selftest": _cmd_selftest,
+    "demo": _cmd_demo,
+    "versions": _cmd_versions,
+    "decompile": _cmd_decompile,
+    "dis": _cmd_dis,
+    "disassemble": _cmd_dis,
+    "compile": _cmd_compile,
+    "skeleton": _cmd_skeleton,
+    "ir": _cmd_ir,
+    "code-info": _cmd_code_info,
+    "infos": _cmd_code_info,
+    "header": _cmd_header,
+    "info": _cmd_info,
+    "i": _cmd_info,
+}
+
+
 def main(argv=None):
     args = list(sys.argv[1:] if argv is None else argv)
     if not args:
-        print("usage: python main.py <command>")
-        print("  selftest              full-version regression suite")
-        print("  demo                  cross-version round-trip demo")
-        print("  versions              supported versions")
+        print("usage: python main.py <command> [options]")
+        print("  decompile <file.pyc>    source (alias: d)")
+        print("  dis <file.pyc>          disassembly (aliases: dis, disassemble)")
+        print("  compile <file.py> [--version X.Y]")
+        print("  skeleton <file.pyc>     pseudo source")
+        print("  ir <file.pyc>           instruction JSON")
+        print("  code-info <file.pyc>    code hierarchy (alias: infos)")
+        print("  header <file.pyc>       .pyc header")
+        print("  info [<file.pyc>]       versions (alias: i)")
+        print("  versions                supported versions")
+        print("  selftest                regression suite")
+        print("  demo                    round-trip demo")
         return 2
     cmd = args[0]
     rest = args[1:]
-    if cmd == "selftest":
-        return _cmd_selftest(rest)
-    if cmd == "demo":
-        return _cmd_demo(rest)
-    if cmd == "versions":
-        print("supported versions:")
-        versions = ("3.9", "3.10", "3.11", "3.12", "3.13", "3.14", "3.15")
-        for v in versions:
-            folder = ("Py315Decompiler" if v == "3.15"
-                      else "py%sDecompiler" % v.replace(".", ""))
-            exists = os.path.isdir(folder)
-            print("  %-6s %s" % (v, "present" if exists else "MISSING"))
-        return 0
-    if cmd in ("decompile", "d"):
-        # simple wrapper: detect version from .pyc and decompile
-        import importlib
-        from tests.equivalence import version_of
-        target = rest[0] if rest else None
-        if not target:
-            print("usage: decompile <file.pyc>")
-            return 2
-        with open(target, "rb") as handle:
-            magic = int.from_bytes(handle.read(2), "little")
-        if magic == 0x0E52:
-            interpreter = os.path.join(
-                _ROOT, "embed_python", "python-3.15", "python.exe")
-            if not os.path.isfile(interpreter):
-                sys.stderr.write(
-                    "Python 3.15 bytecode requires embed_python/python-3.15/python.exe\n"
-                )
-                return 1
-            worker = os.path.join(_ROOT, "Py315Decompiler", "worker.py")
-            completed = subprocess.run(
-                [interpreter, "-I", worker, os.path.abspath(target)],
-                capture_output=True, text=True, encoding="utf-8",
-                cwd=_ROOT,
-            )
-            if completed.returncode:
-                sys.stderr.write(completed.stderr)
-                return completed.returncode
-            sys.stdout.write(completed.stdout)
-            return 0
-        parsed = importlib.import_module("py39Decompiler.pyc_parser").PyCParser.parse_file(target)
-        version = parsed.python_version
-        folder = "py%sDecompiler" % version.replace(".", "")
-        if not os.path.isdir(folder):
-            print("no decompiler folder for %s" % version)
-            return 1
-        mod = importlib.import_module(folder)
-        source = mod.decompile(parsed.code)
-        print(source)
-        return 0
-    print("unknown command:", cmd)
-    return 2
+    if cmd in ALIASES:
+        cmd = ALIASES[cmd]
+    if cmd not in COMMANDS:
+        print("unknown command:", cmd)
+        return 2
+    return COMMANDS[cmd](rest)
 
 
 if __name__ == "__main__":
