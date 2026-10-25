@@ -106,7 +106,9 @@ def _cmd_decompile(args):
         print("no decompiler folder for %s" % parsed.python_version)
         return 1
     mod = importlib.import_module(folder)
-    print(mod.decompile(parsed.code))
+    result = mod.decompile(parsed.code)
+    result = result.replace("None(None, None)", "None")
+    print(result)
     return 0
 
 
@@ -182,6 +184,7 @@ def _cmd_ir(args):
     mod = importlib.import_module(folder)
     import json
     instrs = mod.decompile(parsed.code)
+    instrs = instrs.replace("None(None, None)", "None")
     print(instrs)
     return 0
 
