@@ -63,14 +63,17 @@ KNOWN_EQUIVALENT_314 = {
 }
 
 
+def _package(version: str) -> str:
+    """The self-contained folder name for *version* (3.15 included)."""
+    return "py%sDecompiler" % version.replace(".", "")
+
+
 def _folder_for(version: str):
     # Ensure the workspace root is on sys.path for embedded interpreter workers.
     root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
     if root not in sys.path:
         sys.path.insert(0, root)
-    package = "Py315Decompiler" if version == "3.15" else (
-        "py%sDecompiler" % version.replace(".", ""))
-    return importlib.import_module(package)
+    return importlib.import_module(_package(version))
 
 
 def _running_version() -> str:
@@ -88,7 +91,7 @@ def _check_folder(version: str) -> List[Tuple[str, bool, str]]:
     rows.append(("import", module.VERSION == version,
                  "VERSION=%r" % getattr(module, "VERSION", None)))
     if version == "3.15":
-        parser = importlib.import_module("Py315Decompiler.pyc_parser").PyCParser
+        parser = importlib.import_module(_package(version) + ".pyc_parser").PyCParser
         rows.append(("pyc magic", parser.get_python_version(0x0E52) == version,
                      "magic=0x0e52 -> %s"
                      % parser.get_python_version(0x0E52)))
@@ -154,7 +157,7 @@ def _worker_main(payload: str):
     rows.append(("import", module.VERSION == version,
                  "VERSION=%r" % getattr(module, "VERSION", None)))
     if version == "3.15":
-        parser = importlib.import_module("Py315Decompiler.pyc_parser").PyCParser
+        parser = importlib.import_module(_package(version) + ".pyc_parser").PyCParser
         rows.append(("pyc magic", parser.get_python_version(0x0E52) == version,
                      "magic=0x0e52 -> %s"
                      % parser.get_python_version(0x0E52)))

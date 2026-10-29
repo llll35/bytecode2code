@@ -414,3 +414,171 @@ PROBES = {
         "        pass\n"
     ),
 }
+
+#: Control-flow corpus.  Kept apart from ``PROBES`` on purpose: those are
+#: compared against a long-standing ``n/m identical`` figure, and folding new
+#: cases in would make the number impossible to read.  Each entry here targets
+#: one defect class from ``bugs.md`` -- the block-boundary cases the linear
+#: reader gets wrong -- and is the gate the reconstruction engine is measured
+#: against.
+FLOW_PROBES = {
+    # D2: a ``break``/``continue`` that leaves a ``try`` body.  3.11+ parks the
+    # handler outside the loop, so the loop's back edge and a real ``continue``
+    # are the same shape.
+    "break_in_try": (
+        "def f(xs):\n"
+        "    for x in xs:\n"
+        "        try:\n"
+        "            if x:\n"
+        "                break\n"
+        "        finally:\n"
+        "            g()\n"
+        "    return 1\n"
+    ),
+    "continue_in_try": (
+        "def f(xs):\n"
+        "    for x in xs:\n"
+        "        try:\n"
+        "            if x < 0:\n"
+        "                continue\n"
+        "            g(x)\n"
+        "        except ValueError:\n"
+        "            pass\n"
+        "    return 1\n"
+    ),
+    "continue_in_finally": (
+        "def f(xs):\n"
+        "    i = 0\n"
+        "    while i < len(xs):\n"
+        "        i += 1\n"
+        "        try:\n"
+        "            h(xs[i])\n"
+        "        finally:\n"
+        "            if i:\n"
+        "                continue\n"
+        "    return i\n"
+    ),
+    # D4: the loop's ``else`` is compiled onto the loop's exit target, which is
+    # where the code after the loop already lives.
+    "for_else": (
+        "def f(xs):\n"
+        "    for x in xs:\n"
+        "        if x:\n"
+        "            break\n"
+        "    else:\n"
+        "        g(1)\n"
+        "    return 1\n"
+    ),
+    "for_else_nested": (
+        "def f(xs, ys):\n"
+        "    for x in xs:\n"
+        "        for y in ys:\n"
+        "            if x == y:\n"
+        "                break\n"
+        "        else:\n"
+        "            g(y)\n"
+        "    else:\n"
+        "        h(2)\n"
+        "    return x\n"
+    ),
+    # Nested try/finally with a bare re-raise inside a handler, plus a finally
+    # that can return.  This is the shape the project's reported limitation was
+    # filed against; the reader used to emit the finally body twice.
+    "nested_finally_reraise": (
+        "def f(x):\n"
+        "    try:\n"
+        "        if x < 0:\n"
+        "            raise ValueError('less than zero')\n"
+        "        for i in range(x):\n"
+        "            try:\n"
+        "                if i == 3:\n"
+        "                    raise RuntimeError('hit 3')\n"
+        "            except RuntimeError as e:\n"
+        "                print(i)\n"
+        "                raise\n"
+        "            finally:\n"
+        "                print('inner finally always run')\n"
+        "    except ValueError as ve:\n"
+        "        print(ve)\n"
+        "        return -1\n"
+        "    except Exception as ee:\n"
+        "        print(ee)\n"
+        "    finally:\n"
+        "        if x > 100:\n"
+        "            return 999\n"
+        "        print('outer finally')\n"
+        "    return 0\n"
+    ),
+    "reraise_chain": (
+        "def f():\n"
+        "    try:\n"
+        "        try:\n"
+        "            try:\n"
+        "                raise OSError('deep error')\n"
+        "            except OSError:\n"
+        "                raise IOError('wrap os error')\n"
+        "        except IOError:\n"
+        "            raise\n"
+        "    except Exception as e:\n"
+        "        print(e)\n"
+    ),
+    # A ``finally`` that returns hides the exception the ``try`` was raising,
+    # so the handler's re-raise is not in the stream at all.
+    "finally_return": (
+        "def f(x):\n"
+        "    try:\n"
+        "        if x:\n"
+        "            return 1\n"
+        "        raise ValueError('v')\n"
+        "    except ValueError:\n"
+        "        return 2\n"
+        "    finally:\n"
+        "        g(3)\n"
+        "    return 4\n"
+    ),
+    # All four ``try`` clauses at once: ``else`` lives between the body's jump
+    # and the handler's merge point, ``finally`` then runs for both paths.
+    "try_except_else_finally": (
+        "def f(n):\n"
+        "    try:\n"
+        "        x = int(n)\n"
+        "    except ValueError as e:\n"
+        "        print(e)\n"
+        "    else:\n"
+        "        x += 1\n"
+        "    finally:\n"
+        "        print('done')\n"
+        "    return x\n"
+    ),
+    # Open defect: a ``return`` after a ``with`` that is itself inside a
+    # ``try``; the with-exit call and the block pop leave the reader's stack
+    # model a residual value.
+    "with_in_try_return": (
+        "def f(p):\n"
+        "    try:\n"
+        "        with open(p) as fh:\n"
+        "            d = fh.read()\n"
+        "        return d\n"
+        "    except OSError:\n"
+        "        return None\n"
+        "def g(p):\n"
+        "    with open(p) as fh:\n"
+        "        try:\n"
+        "            return fh.read()\n"
+        "        finally:\n"
+        "            fh.close()\n"
+    ),
+    "try_in_loop_with": (
+        "def f(xs):\n"
+        "    total = 0\n"
+        "    for x in xs:\n"
+        "        try:\n"
+        "            with open(x) as fh:\n"
+        "                total += len(fh.read())\n"
+        "        except OSError as e:\n"
+        "            print(e)\n"
+        "            continue\n"
+        "    return total\n"
+    ),
+}
+

@@ -1,8 +1,160 @@
 # 项目缺陷清单（bugs.md）
 
-> 最后更新：2026-10-22。状态含义：
+> 最后更新：2026-10-28。状态含义：
 > **已修复** / **部分修复** / **未修复** / **不适用**。
 > 复现与验证命令见文末。
+
+---
+
+## 2026-10-28 修复摘要
+
+起点是上一轮留下的 41/77（HEAD 的重写器 + 当前工作树），本轮验证节点：
+41 → **49** → **55** → **56**。全部改动仍未提交，也未推送。
+
+| 命令 | 修复前 | 修复后 |
+|------|--------|--------|
+| `python -m tests.run` 的 CONTROL FLOW | 41/77 | **56/77**（最近一次 3.11 组 10/11 → **11/11**） |
+| `python -m tests.run` 的 ROUND-TRIP | 232/263 | 232/263（最近两次完整输出逐字一致） |
+| `python -m tests.test_cfg`（3.9） | 9/9 | 15/15（含 6 项输出回归），3 项 3.11 专项跳过 |
+| `python tests/test_cfg.py Rewriter311Tests`（3.11） | 未添加 | 3/3 |
+| `python tests/test_cfg.py OutputNormalizationTests`（七版本分别运行） | 未添加 | 各 6/6，共 42 项通过 |
+| 3.9 / 3.10 控制流组 | 11/11、11/11 | 11/11、11/11 |
+
+| # | 缺陷 | 影响版本 | 根因 / 修法 |
+|---|------|----------|-------------|
+| A | 嵌套 `try` 被摊平成一个 `try` 的子句列表 | 3.11–3.15 | 3.11 的嵌套关系写在表的**退链**里：一条区域的 `end` 正好是下一条的 `start`。`Rewriter` 只做单步回溯，于是内层的 `SETUP_FINALLY` 落在外层区域内，reader 把整棵树读平。现在 `_region_start` 沿退链传递回溯，并且会越过「嵌套子句的 handler 头」（`_table_heads`）；`try_replace` 分支（handler 头被改写成 `DUP_TOP`）也要发 `SETUP_FINALLY`（`_emit_block_setups`）；整个区域就是嵌套语句的块，其 `POP_BLOCK` 补在 handler 头之前（`_close_before_head`）。+8 |
+| B | `finally` 只在 handler 里留了一份文本 | 3.11–3.15 | `flow_finally_return`：`try` 的每条出口都跑完子句后离开，**没有正常路径**，因此表里根本没有内联副本区。reader 侧 `_collect_finally_body` 增加「块弹到 handler 头之间什么都没有」的分支——就在 handler 处读子句、从 handler 之后续读；`Decompiler311._collect_finally_body` 原本整个遮蔽了这段逻辑，现在把该情形交回 `super()`。同时 `_hide_escape_copies` 不再要求出口副本前面必须有 `POP_BLOCK`（3.11 没有块栈），但**裸副本**必须紧跟出口（`limit=2`）：`try: g() finally: h()` 的两种读法指令序列相同，放宽一步就会把 `g()` 当成副本吃掉（曾在 3.15 上把 ROUND-TRIP 拖到 231/263，已复验回到 232）。+5 |
+| C | `try/except/else/finally` 的外层块关得太早 | 3.11 | `else` 段的 `end` 恰好是 `except` 链的 handler 头，`_place_one_close` 的 `limit = min(nested)` 把外层弹块钉在了那里，内联 `finally` 副本泄漏成顺序代码。`nested` 现在只认真正的嵌套块——`with` 的 handler（`self.with_targets`）；同一语句的 `except` 链不构成边界。并补上「区域一路顶到 handler」的兜底与退避桩（`COPY`/`POP_EXCEPT`/`RERAISE`，`_unwind_stubs`）跳过。+1 |
+
+**注意**：C 的完整形态（连 `limit` 一起去掉）在 3.11 上是对的，在 3.12/3.13/3.15
+上会把 `flow_with_in_try_return` 打回去（实测 6→5、6→5、5→5、5→4）。逐版本试过，
+只有「`nested` 限定为 `with` 处理器 + 兜底 + 桩跳过」这一组合在七个后端上都不回退。
+另外 `decomp311.py` 的五份副本**并非逐字节相同**（3.11 是 CRLF，3.12–3.15 是 LF，
+且各自有版本特有方法），移植要按锚点逐份核对，不能直接 cp。
+
+### 3.11 嵌套 finally 补修
+
+`PUSH_EXC_INFO` 被删除后，合成的 `SETUP_FINALLY` 仍指向已消失的 handler 头。
+reader 会把缺失地址向后取整，CFG 却要求目标地址精确存在，因此漏掉了两层
+`finally` 区域，内层子句被错误读成 `else`。`Rewriter._resolve_handler_targets`
+现在把 setup 的目标解析到 handler 第一条存活指令，**不移动原指令地址**。
+另外 `_handler_end` 复用基类的分支感知扫描，避免在条件 `return` 处提前结束，
+把 handler 余下的副本重复输出到整个 `try` 之后。
+
+本次只改 `py311Decompiler/decomp311.py`。3.12/3.13 的内存实验使
+`with_in_try_return` 从通过变为失败，未移植；较新版本仍需独立修复。
+新增 3 项专项测试检查 handler 精确目标与区域保留、条件返回后的 handler 边界、
+往返一致且 AST 中没有重复子句。原 3.9 手工边界断言未变，七份 reader 哈希一致。
+完整门禁仍因已有失败返回 1；此次只新增一个通过项，无通过项回退。
+
+### 合并 try 外壳与模块隐式返回
+
+用户命令 `embed_python/python-3.10/python.exe main.py decompile test_sc.pyc`
+中的两层 `try` 来自编译器把 `except` 链与 `finally` 保护区分开编码。
+现在仅在输出 AST 时合并：外层只有 `finally`、没有 handler/else、body 只有
+一个带 handler 且没有自身 `finally` 的 `try`。真实嵌套异常链、双层 finally、
+带前后语句或自身 handler 的外壳均保留；重建期间不改变区域结构。
+
+模块的递归分支仍使用同一个 `<module>` code object，不能仅靠递归参数
+`is_module` 判断返回是否合法。`RETURN_VALUE`、`RETURN_CONST` 与 `with`
+退出路径现在区分模块作用域，模块禁用 return 型条件表达式折叠，函数返回保留。
+模块分支中复制的隐式返回仍用于识别 `else` 边界，空分支保留 `pass`，
+避免去掉返回后把 `else` 变成无条件语句或丢失条件求值。
+
+验证：原始 CLI 输出可编译，与 `test_sc.py` 的 AST 完全一致，与原 `.pyc`
+往返等价；`nested_try_chain()` 的真实嵌套保留。新增 6 项输出回归在七个
+解释器均通过，覆盖合并/不合并边界、递归作用域、模块空分支、if/else/elif、
+with、三元赋值及函数返回。最终完整门禁输出与修复前逐字节一致：
+ROUND-TRIP 232/263、CONTROL FLOW 56/77，仍因已有失败退出 1。
+七份 `decompiler.py` 一致，七份 `cfg_flow.py` 一致且本次未改动。
+
+### 仍未修复
+
+* `flow_nested_finally_reraise`：3.12–3.15 仍失败，3.11 已修复。
+* `flow_try_except_else_finally`：3.12–3.15（3.11 已修）。同一条源码头在 3.12 上
+  需要另一处修正，`limit` 相关的两种改法都不动它。
+* `flow_for_else_nested` / `flow_try_in_loop_with`（3.12–3.15）、
+  `flow_break_in_try`（3.12/3.13）、`flow_continue_in_finally`（3.14/3.15）、
+  `flow_with_in_try_return`（3.15）。
+* 本文档里 **「2026-10-27 修复摘要」出现了两次且内容重复**（本轮未合并，
+  避免把上一轮的记录一起改错）。
+* CFG 手工边界仍只适用于 3.9，另有 3.11 重写器专项；输出规范化测试已覆盖七版本。
+  `independent_control_flow/` 目录本轮未改动。
+* 额外模块探针仍暴露独立问题，未扩大到本次修复：模块 `except E as e` 的恢复、
+  3.9 双层 if/else 的内层 else 丢失、3.11+ 空 try 的嵌套 finally 恢复、
+  3.15 模块 if/with/else 把 else 语句重复读入 with。这些不代表全部模块形状已通过。
+
+---
+
+## 2026-10-27 修复摘要
+
+本轮把 `except` 子句的边界交给控制流图（`cfg_flow.py`）：子句用 `return` 离开
+`try` 时，它弹出的那个 `POP_BLOCK` 属于**外层** `finally` 区域，贴在后面的那份
+`finally` 内联副本就不再算进子句体。
+
+| 命令 | 修复前 | 修复后 |
+|------|--------|--------|
+| `python -m tests.run` 的 CONTROL FLOW | 45/77 | **46/77**（3.10 组 10/11 → **11/11**） |
+| `python -m tests.run` 的 ROUND-TRIP | 232/263 | 232/263（未回归） |
+| `python -m tests.test_cfg` | 9/9 | 9/9 |
+
+| # | 缺陷 | 影响版本 | 根因 / 修法 |
+|---|------|----------|-------------|
+| 14 | `except` 子句里多出一次 `finally` | 3.10 | `_parse_handler_body` 从前向扫描一路读到 `RETURN_VALUE`，把外层 `finally` 的内联副本读进了子句体——`except ValueError: g(3); return 2`。3.9 同一形状是对的，靠的是 `_hide_escape_copies` 把那段标成 handled range；这条规则在 3.10 上恰好失效：出口上的 `POP_BLOCK` 正是图给出的区域终点（`try_end_idx`），被「终点后面那份副本是子句本身」排除掉。现在改为直接问图：这个 `POP_BLOCK` 关的是哪个 `finally` 区域（`_enclosing_finally_copy`），副本与区域的 handler 逐步对齐（`_inline_clause_end`），对齐的段落从子句区间里挖走，子句自己的出口留在后面（`_emit_except_clause`） |
+
+### 仍未修复
+
+* **3.11+ 的同一族缺陷换了成因**：`flow_finally_return` / `flow_reraise_chain` /
+  `flow_try_except_else_finally` / `flow_nested_finally_reraise` 在 3.11–3.15 仍
+  失败。原因是 `decomp311.Rewriter` 在进入 reader 之前就把 3.11+ 的
+  `try/finally` 整个内联掉了——实测该后端看到的指令流里**根本没有 `finally`
+  区域**（`_exception_regions` 只剩一个 `except`），引擎自然无从判断副本归属于谁。
+  要修这一族，必须让引擎直接读 `co_exceptiontable`，而不是在合成流上补规则；
+  `cfg_flow.py` 的模块 docstring 声称已经这么做，实际代码里一次都没有读过。
+* **D2**：`try` 块内的 `break` / `continue`（3.11 / 3.12 的 handler 被放到循环
+  之外，循环回边与真实 `continue` 同形）。
+* **D4**：循环的 `else` 子句。3.9/3.10 把 `else` 放在循环的出口目标上，与
+  「循环之后的代码」无法区分；3.11/3.12 同样如此。
+* **缺陷 21**：3.12 的 PEP 695 类型参数。
+* `with a as x, b as y:` 被拆成两个嵌套的 `with`（语义相同，AST 不同）。
+* `try` 里的 `with` 后面跟 `return`（3.11 / 3.12）：`with` 的体在 `try` 里
+  结束得太早，`return` 的位置仍然读不准。
+
+---
+
+## 2026-10-27 修复摘要
+
+本轮把 `except` 子句的边界交给控制流图（`cfg_flow.py`）：子句用 `return` 离开
+`try` 时，它弹出的那个 `POP_BLOCK` 属于**外层** `finally` 区域，贴在后面的那份
+`finally` 内联副本就不再算进子句体。
+
+| 命令 | 修复前 | 修复后 |
+|------|--------|--------|
+| `python -m tests.run` 的 CONTROL FLOW | 45/77 | **46/77**（3.10 组 10/11 → **11/11**） |
+| `python -m tests.run` 的 ROUND-TRIP | 232/263 | 232/263（未回归） |
+| `python -m tests.test_cfg` | 9/9 | 9/9 |
+
+| # | 缺陷 | 影响版本 | 根因 / 修法 |
+|---|------|----------|-------------|
+| 14 | `except` 子句里多出一次 `finally` | 3.10 | `_parse_handler_body` 从前向扫描一路读到 `RETURN_VALUE`，把外层 `finally` 的内联副本读进了子句体——`except ValueError: g(3); return 2`。3.9 同一形状是对的，靠的是 `_hide_escape_copies` 把那段标成 handled range；这条规则在 3.10 上恰好失效：出口上的 `POP_BLOCK` 正是图给出的区域终点（`try_end_idx`），被「终点后面那份副本是子句本身」排除掉。现在改为直接问图：这个 `POP_BLOCK` 关的是哪个 `finally` 区域（`_enclosing_finally_copy`），副本与该区域的 handler 逐步对齐（`_inline_clause_end`），对齐的段落从子句区间里挖走，子句自己的出口留在后面（`_emit_except_clause`） |
+
+### 仍未修复
+
+* **3.11+ 的同一族缺陷换了成因**：`flow_finally_return` / `flow_reraise_chain` /
+  `flow_try_except_else_finally` / `flow_nested_finally_reraise` 在 3.11–3.15 仍
+  失败。原因是 `pyNNDecompiler/decomp311.py` 的 `Rewriter` 在进入 reader 之前就把
+  3.11+ 的 `try/finally` 整个内联掉了——实测该后端看到的指令流里**根本没有
+  `finally` 区域**（`_exception_regions` 只剩一个 `except`），引擎自然无从判断
+  副本归属于谁。要修这一族，必须让引擎直接读 `co_exceptiontable`，而不是在合成流
+  上补规则。`cfg_flow.py` 的模块 docstring 原先声称已经这么做，本轮已改成实际状态。
+* **D2**：`try` 块内的 `break` / `continue`（3.11 / 3.12 的 handler 被放到循环
+  之外，循环回边与真实 `continue` 同形）。
+* **D4**：循环的 `else` 子句。3.9/3.10 把 `else` 放在循环的出口目标上，与
+  「循环之后的代码」无法区分；3.11/3.12 同样如此。
+* **缺陷 21**：3.12 的 PEP 695 类型参数。
+* `with a as x, b as y:` 被拆成两个嵌套的 `with`（语义相同，AST 不同）。
+* `try` 里的 `with` 后面跟 `return`（3.11 / 3.12）：`with` 的体在 `try` 里
+  结束得太早，`return` 的位置仍然读不准。
 
 ---
 
@@ -392,8 +544,13 @@ def first():
 ## 验证命令
 
 ```
-python -m tests.run                 # 68/72 round-trip 一致（按版本分组，见下）
-python main.py selftest             # 394 项检查，0 失败
+python -m tests.run                 # ROUND-TRIP 232/263、CONTROL FLOW 56/77（仍有已有失败）
+python -m tests.test_cfg            # 3.9：15 项通过，3 项 3.11 专项跳过
+embed_python/python-3.11/python.exe tests/test_cfg.py Rewriter311Tests  # 3 项通过
+# 七版本分别执行下面的输出回归（将 3.10 替换为对应版本）：
+embed_python/python-3.10/python.exe tests/test_cfg.py OutputNormalizationTests  # 各 6 项通过
+embed_python/python-3.10/python.exe main.py decompile test_sc.pyc  # AST 与原源码一致，往返等价
+python main.py selftest             # 本次 host 3.9：2/2 通过
 python -B _scratch/probe_controlflow.py 3.9 3.10 3.11 3.12
 python -B _scratch/probe_probes_multiver.py 3.12   # 探针语料单版本往返（换 3.9/3.10/3.11）
 python -B _scratch/probe_retfin.py          # try/finally 中 return 的形态（host 3.13，全失败）

@@ -68,10 +68,21 @@ def _run_group(version: str) -> int:
 
     names = [name for name, needed in _sample_versions().items()
              if needed == version]
-    results = test_roundtrip.run_file_samples(names) + test_roundtrip.run_probes()
+    results = (test_roundtrip.run_file_samples(names)
+               + test_roundtrip.run_probes()
+               + test_roundtrip.run_flow_probes())
     with open(os.environ[OUT_ENV], "w", encoding="utf-8") as handle:
         json.dump([result._asdict() for result in results], handle)
     return 0
+
+
+#: Results for a probe whose name starts with this prefix are reported in their
+#: own section, so adding control-flow cases never moves the headline figure.
+FLOW_PREFIX = "flow_"
+
+
+def _is_flow(result) -> bool:
+    return result.name.startswith(FLOW_PREFIX)
 
 
 def _collect(version: str, workdir: str, index: int):
@@ -81,7 +92,9 @@ def _collect(version: str, workdir: str, index: int):
     names = [name for name, needed in _sample_versions().items()
              if needed == version]
     if version == _running_version():
-        return test_roundtrip.run_file_samples(names) + test_roundtrip.run_probes()
+        return (test_roundtrip.run_file_samples(names)
+                + test_roundtrip.run_probes()
+                + test_roundtrip.run_flow_probes())
 
     interpreter = _interpreter_for(version)
     if interpreter is None:
@@ -125,12 +138,21 @@ def main() -> int:
     print("ROUND-TRIP  (decompile -> recompile -> compare code objects)")
     print("=" * 60)
 
-    total = 0
-    failed = 0
+    collected = []
     with tempfile.TemporaryDirectory() as workdir:
         for index, version in enumerate(ordered):
+            collected.append((version, _collect(version, workdir, index)))
+
+    def _report(include_flow: bool):
+        """Print one section; returns ``(ok, total)`` for it."""
+        total = 0
+        failed = 0
+        for version, results in collected:
+            rows = [r for r in results if _is_flow(r) == include_flow]
+            if not rows:
+                continue
             print("\n-- Python %s --" % version)
-            for result in _collect(version, workdir, index):
+            for result in rows:
                 total += 1
                 if result.ok:
                     print("  %-24s OK" % result.name)
@@ -142,8 +164,18 @@ def main() -> int:
                     print("      " + diff)
                 if not VERBOSE and len(result.diffs) > len(shown):
                     print("      ... %d more" % (len(result.diffs) - len(shown)))
+        return total - failed, total
 
-    print("\n%d/%d identical" % (total - failed, total))
+    ok, total = _report(include_flow=False)
+    print("\n%d/%d identical" % (ok, total))
+
+    print()
+    print("=" * 60)
+    print("CONTROL FLOW  (block-boundary corpus, the reconstruction gate)")
+    print("=" * 60)
+    flow_ok, flow_total = _report(include_flow=True)
+    print("\n%d/%d identical" % (flow_ok, flow_total))
+    failed = (total - ok) + (flow_total - flow_ok)
 
     print()
     print("=" * 60)

@@ -1,7 +1,7 @@
 """Unified entry point for the bytecode2code decompiler (new framework only).
 
 No dependency on the archived `pyvers` / `bytecode2code` framework.
-The self-contained version folders (`py39Decompiler` ... `Py315Decompiler`)
+The self-contained version folders (`py39Decompiler` ... `py315Decompiler`)
 are the only decompilers used.
 """
 
@@ -66,8 +66,7 @@ def _cmd_demo(args):
                 "import importlib,sys; "
                 "root,path=sys.argv[1:]; sys.path.insert(0,root); "
                 "v='%d.%d' % sys.version_info[:2]; "
-                "p='Py315Decompiler' if v=='3.15' else "
-                "'py%sDecompiler' % v.replace('.',''); "
+                "p='py%sDecompiler' % v.replace('.',''); "
                 "parser=importlib.import_module(p+'.pyc_parser'); "
                 "code=parser.PyCParser.parse_file(path).code; "
                 "print(importlib.import_module(p).decompile(code))"
@@ -107,7 +106,6 @@ def _cmd_decompile(args):
         return 1
     mod = importlib.import_module(folder)
     result = mod.decompile(parsed.code)
-    result = result.replace("None(None, None)", "None")
     print(result)
     return 0
 
@@ -150,7 +148,7 @@ def _cmd_compile(args):
 def _cmd_info(args):
     versions = ("3.9", "3.10", "3.11", "3.12", "3.13", "3.14", "3.15")
     for v in versions:
-        folder = ("Py315Decompiler" if v == "3.15" else "py%sDecompiler" % v.replace(".", ""))
+        folder = "py%sDecompiler" % v.replace(".", "")
         exists = os.path.isdir(folder)
         interp_path = os.path.join(_ROOT, "embed_python", "python-" + v, "python.exe")
         interp_exists = os.path.isfile(interp_path)
@@ -184,7 +182,6 @@ def _cmd_ir(args):
     mod = importlib.import_module(folder)
     import json
     instrs = mod.decompile(parsed.code)
-    instrs = instrs.replace("None(None, None)", "None")
     print(instrs)
     return 0
 
