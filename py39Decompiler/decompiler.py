@@ -9,6 +9,7 @@ from dataclasses import dataclass
 from .cfg_flow import (
     ExceptionAnalyzer, KIND_AS_CLEANUP, KIND_EXCEPT, KIND_FINALLY, KIND_WITH,
     build_cfg)
+from .independent_control_flow import full_engine, rebuild_engine, control_engine
 from .disassembler import Disassembler, Instruction
 from .errors import DecompilationError
 
