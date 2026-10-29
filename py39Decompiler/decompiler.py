@@ -1861,6 +1861,10 @@ class Decompiler:
             if not instructions:
                 return self._indent(indent_level) + "pass"
             stmts = self._emit_statements(code, instructions, is_module=is_module)
+            # Direct 3.9 control-flow complete fix: rebuild engine cleans finally/raise
+            engine = full_engine.ControlFlowEngine(instructions)
+            rebuilt = engine.rebuild_try_finally_raise(stmts)
+            stmts = rebuilt if rebuilt else stmts
             stmts = self._drop_dead_tail(stmts)
             stmts = self._restore_docstring(stmts)
             if not is_module:
