@@ -6801,12 +6801,32 @@ class Decompiler:
             return self._fallback_source(stmts, indent_level, code, is_module)
 
     def _filter_bad_statements(self, stmts):
+        def clean(node):
+            if isinstance(node, ast.Expr) and isinstance(node.value, ast.Call):
+                func = node.value.func
+                if isinstance(func, ast.Constant) and func.value is None:
+                    return None
+            for field, value in ast.iter_fields(node):
+                if isinstance(value, list):
+                    new_list = []
+                    for item in value:
+                        if isinstance(item, ast.AST):
+                            cleaned = clean(item)
+                            if cleaned is not None:
+                                new_list.append(cleaned)
+                        else:
+                            new_list.append(item)
+                    setattr(node, field, new_list)
+                elif isinstance(value, ast.AST):
+                    cleaned = clean(value)
+                    if cleaned is not None:
+                        setattr(node, field, cleaned)
+            return node
         cleaned = []
         for s in stmts:
-            if isinstance(s, ast.Expr) and isinstance(s.value, ast.Call):
-                if isinstance(s.value.func, ast.Constant) and s.value.func.value is None:
-                    continue  # Remove broken None(None, None, None)
-            cleaned.append(s)
+            c = clean(s)
+            if c is not None:
+                cleaned.append(c)
         return cleaned
 
     def _fix_lineno(self, nodes):
