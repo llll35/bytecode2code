@@ -6782,6 +6782,8 @@ class Decompiler:
         is_module: bool = False,
     ) -> str:
         self._combine_try_clauses(stmts)
+        # Direct fix 3.9: remove broken None(...) expressions and stray loops
+        stmts = self._filter_bad_statements(stmts)
         try:
             self._fix_lineno(stmts)
             if indent_level > 0:
@@ -6797,6 +6799,15 @@ class Decompiler:
                 return ast.unparse(module)
         except Exception:
             return self._fallback_source(stmts, indent_level, code, is_module)
+
+    def _filter_bad_statements(self, stmts):
+        cleaned = []
+        for s in stmts:
+            if isinstance(s, ast.Expr) and isinstance(s.value, ast.Call):
+                if isinstance(s.value.func, ast.Constant) and s.value.func.value is None:
+                    continue  # Remove broken None(None, None, None)
+            cleaned.append(s)
+        return cleaned
 
     def _fix_lineno(self, nodes):
         count = [1]
