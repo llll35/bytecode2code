@@ -98,7 +98,8 @@ class PyCParser:
         0x0DA7: "3.11",
         0x0DCB: "3.12",
         0x0DF3: "3.13",
-        0x0E2B: "3.15",
+        0x0E2B: "3.14",
+        0x0E52: "3.15",
     }
 
     @classmethod

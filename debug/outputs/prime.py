@@ -27,7 +27,6 @@ class ReciprocalAnalyzer:
                     raise ValueError('不支持非有限小数或高精度浮点数')
             except:
                 raise ValueError('仅支持整数或有限小数输入')
-        raise ValueError('仅支持整数或有限小数输入')
 
     def _convert_to_fraction(self):
         if isinstance(self.x, float):

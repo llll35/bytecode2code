@@ -102,6 +102,15 @@ DROPPED = frozenset((
 #: The rotation each ``SWAP`` depth stands for.
 SWAP_TO_ROT = {2: 'ROT_TWO', 3: 'ROT_THREE', 4: 'ROT_FOUR'}
 
+#: Opcodes the reader never sees: padding the compiler leaves between two
+#: statements, and the stack bookkeeping 3.9 spelled differently.  Not every
+#: dropped opcode is silent -- ``RETURN_CONST`` becomes a load plus a return.
+_SILENT = frozenset((
+    'NOP', 'RESUME', 'CACHE', 'PRECALL', 'PUSH_NULL', 'MAKE_CELL',
+    'COPY_FREE_VARS', 'RETURN_GENERATOR', 'NOT_TAKEN', 'POP_ITER',
+    'END_FOR', 'END_SEND', 'KW_NAMES',
+))
+
 #: Opcodes that may sit between the end of a ``with`` body and the implicit
 #: ``__exit__`` call: the three ``None`` operands 3.12 pushes for it, and the
 #: ``PRECALL`` 3.11 slips in front of the call itself.
@@ -1362,16 +1371,61 @@ class Rewriter(object):
         """
         setups = {}
         for start, target in blocks:
-            begins = start
-            for entry in entries:
-                if entry.target == target or entry.end != start:
-                    continue
-                if start <= entry.target < target:
-                    begins = min(begins, entry.start)
+            begins = self._region_start(entries, start, target)
             setups.setdefault(begins, []).append(target)
         for targets in setups.values():
             targets.sort(reverse=True)
         return setups
+
+    def _region_start(self, entries, start, target):
+        """Offset where 3.9 opened the block whose handler is *target*.
+
+        The table splits a ``try`` body at every nested block, so an outer
+        ``try`` shows up as a run of entries whose handlers sit further out:
+        the innermost handler owns the first span and the outer one picks up
+        where that span ends.  3.9 opened both blocks before the first
+        statement instead, so an entry whose predecessor's region ends exactly
+        where it begins, and whose handler lies inside it, moves back to that
+        predecessor's start -- and keeps moving: a nest of three ``try``
+        statements is three such steps, and stopping after one opens the
+        middle block inside the first clause instead of in front of the body.
+
+        A region can also start *past* the nested block it protects, because an
+        exit that already ran the inlined ``finally`` is left out of the table:
+        ``try: ... except: ... finally: ...`` protects the clause chain but not
+        the ``return`` that ran the clause.  Any handler dispatch that lies
+        inside the region therefore pulls the start back to its own body, which
+        is where 3.9 pushed that block -- and ours, in front of it.
+        """
+        heads = self._table_heads(entries)
+        begins = start
+        while True:
+            for entry in entries:
+                if entry.target == target or entry.start >= begins:
+                    continue
+                if not begins <= entry.target < target:
+                    continue
+                if entry.end == begins or entry.target in heads:
+                    begins = entry.start
+                    break
+            else:
+                return begins
+
+    def _table_heads(self, entries):
+        """Offsets the table dispatches through -- one per ``try`` statement.
+
+        Only a real handler starts a clause chain.  The ``COPY`` /
+        ``POP_EXCEPT`` / ``RERAISE`` stub a handler installs to unwind its own
+        frame is a table target too, and counting it as a block would open a
+        ``SETUP_FINALLY`` around the unwinding code.
+        """
+        by_offset = {raw.offset: n for n, raw in enumerate(self.raw)}
+        heads = set()
+        for entry in entries:
+            index = by_offset.get(entry.target)
+            if index is not None and self.raw[index].opname == 'PUSH_EXC_INFO':
+                heads.add(entry.target)
+        return heads
 
     def _offset_index(self, offset):
         """Index of the instruction at *offset*, or ``None``."""
@@ -1398,8 +1452,129 @@ class Rewriter(object):
             for target in targets:
                 self._place_one_close(entries, raw_list, begins, target,
                                       closes)
+        self._place_exit_closes(entries, raw_list, closes)
         for key in [k for k in closes if k in self.with_closes]:
             del closes[key]
+
+    def _place_exit_closes(self, entries, raw_list, closes):
+        """Anchor a ``POP_BLOCK`` in front of every other copy of a clause.
+
+        3.9 pasted a ``finally`` clause into each path that leaves the block --
+        the ``break`` out of a loop as well as the fall-through -- and popped
+        the block ahead of every copy.  The table describes the protected range
+        alone, so the pass above closes it once and the reader takes the body to
+        end there, which loses the statement that actually exits.  A copy of the
+        handler's clause outside the range is such an exit, so it gets its own
+        close too.
+        """
+        by_offset = {raw.offset: n for n, raw in enumerate(raw_list)}
+        ends = {}
+        for entry in entries:
+            ends[entry.target] = max(entry.end, ends.get(entry.target, 0))
+        for target, end in ends.items():
+            h_idx = by_offset.get(target)
+            if h_idx is None or raw_list[h_idx].opname != 'PUSH_EXC_INFO':
+                # Only a body handler has exit copies; the stub a handler
+                # installs for its own cleanup is not one.
+                continue
+            if not self._is_finally_handler(raw_list, h_idx):
+                continue
+            clause = self._clause_shape(raw_list, h_idx)
+            if not clause:
+                continue
+            for start in self._clause_copies(raw_list, clause, h_idx, end):
+                anchor = self._close_anchor(raw_list, start)
+                if anchor is None or anchor in closes or anchor in self.with_closes:
+                    continue
+                closes[anchor] = end
+
+    def _close_anchor(self, raw_list, start):
+        """Offset of the instruction a ``POP_BLOCK`` can follow.
+
+        The copy is preceded by whatever the compiler parked there -- usually a
+        jump, but a ``NOP`` or a ``PRECALL`` is dropped before it reaches the
+        reader, so the close goes on the last instruction that survives.
+        """
+        index = start
+        while index > 0 and (raw_list[index - 1].offset in self._drops
+                             or raw_list[index - 1].opname in _SILENT):
+            index -= 1
+        if index == 0:
+            return None
+        return raw_list[index - 1].offset
+
+    def _unwind_stubs(self, entries):
+        """Ranges the table protects that are only an unwinding stub.
+
+        3.11 keeps an in-flight exception alive across a ``finally`` copy by
+        running ``COPY`` / ``POP_EXCEPT`` / ``RERAISE``, and gives that stub a
+        table entry of its own.  The emitter drops the instructions, so a block
+        close must not land inside one: 3.9 wrote the pop where the *source*
+        path ends, not where the unwinding stub sits.
+        """
+        out = []
+        for entry in entries:
+            index = self._offset_index(entry.start)
+            if index is not None and self.raw[index].opname == 'COPY':
+                out.append((entry.start, entry.end))
+        return out
+
+    def _close_before_head(self, raw_list, target, closes):
+        """Anchor the close of a block whose whole body is a nested block.
+
+        *target* is the handler head.  Between the instruction in front of it
+        and the head itself sits only the region this block protects and the
+        unwinding stub -- ``COPY`` / ``POP_EXCEPT`` / ``RERAISE``, which the
+        table protects through its own ``COPY`` and which the emitter drops --
+        so the ``POP_BLOCK`` 3.9 wrote on the way out of the inner block goes on
+        the last instruction that reaches the reader.  That is where the outer
+        chain's ``DUP_TOP`` starts to read.
+        """
+        index = self._offset_index(target)
+        if index is None or index == 0:
+            return
+        stubs = self._unwind_stubs(_exception_entries(self.code))
+        index -= 1
+        while index > 0 and any(low <= raw_list[index].offset < high
+                                for low, high in stubs):
+            index -= 1
+        anchor = raw_list[index].offset
+        if anchor in closes or anchor in self.with_closes:
+            return
+        closes[anchor] = target
+
+    def _clause_shape(self, raw_list, h_idx):
+        """The ``(opname, argval)`` pairs the handler at *h_idx* runs.
+
+        This is the clause itself: a ``finally`` handler is its re-raise
+        preceded by a verbatim copy of the inline code, so the two are compared
+        through exactly this list.
+        """
+        shape = []
+        j = h_idx + 1
+        while j < len(raw_list) and raw_list[j].opname != 'RERAISE':
+            shape.append((raw_list[j].opname, raw_list[j].argval))
+            j += 1
+        if j >= len(raw_list) or raw_list[j].opname != 'RERAISE':
+            return []
+        return shape
+
+    def _clause_copies(self, raw_list, clause, h_idx, region_end):
+        """Indices where *clause* is pasted outside the protected range.
+
+        A copy inside the range (``try: g() finally: g()``) is body code, not an
+        exit, so only runs that start at or after ``region_end`` are returned.
+        """
+        width = len(clause)
+        out = []
+        for start in range(1, h_idx - width + 1):
+            if raw_list[start].offset < region_end:
+                continue
+            if all(raw_list[start + k].opname == clause[k][0]
+                   and raw_list[start + k].argval == clause[k][1]
+                   for k in range(width)):
+                out.append(start)
+        return out
 
     def _place_one_close(self, entries, raw_list, start, target, closes):
         # A region interrupted by a nested block -- a ``with`` or another
@@ -1409,17 +1584,34 @@ class Rewriter(object):
         # after it are that handler's unwinding code, which the table sends
         # here as well.
         nested = [e.target for e in entries
-                  if e.target != target and start < e.target <= target]
+                  if e.target != target and start < e.target <= target
+                  and e.target in self.with_targets]
         limit = min(nested) if nested else target
         spans = [e for e in entries
                  if e.target == target and start <= e.start < limit]
         if not spans:
+            # Nothing the table protects for this handler begins before the
+            # nested block that shares it: the outer ``try``'s whole body *is*
+            # the inner ``try`` statement, and 3.9 closed the outer block on the
+            # way out of the inner chain -- right in front of this handler.
+            # Closing there is what keeps the two blocks nested instead of
+            # folding the outer one into the inner clause.
+            self._close_before_head(raw_list, target, closes)
             return
         end = max(e.end for e in spans)
+        if end >= target:
+            # The last span runs right up to the handler, so the block is never
+            # closed inside its own region: 3.9 popped it on the way out of the
+            # chain, in front of the handler head.
+            self._close_before_head(raw_list, target, closes)
+            return
         index = self._offset_index(end)
         if index is None:
             index = len(raw_list)
-        while index > 0 and raw_list[index - 1].offset in self._drops:
+        stubs = self._unwind_stubs(entries)
+        while index > 0 and (raw_list[index - 1].offset in self._drops
+                             or any(lo <= raw_list[index - 1].offset < hi
+                                    for lo, hi in stubs)):
             index -= 1
         if index == 0:
             return
@@ -1496,7 +1688,12 @@ class Rewriter(object):
                 # A ``finally`` handler is not a clause of an ``except`` chain:
                 # it runs the clause and re-raises.  3.9 wrote it without the
                 # ``DUP_TOP`` the reader uses to recognise a clause, so it is
-                # left as it is.
+                # left as it is -- and without the marker either: 3.9 pushed the
+                # exception triple with the ``SETUP_FINALLY`` itself, so its
+                # clause begins at the first instruction of the handler.  Leaving
+                # ``PUSH_EXC_INFO`` in front of it makes the reader stop the
+                # clause before it starts and print an empty ``finally``.
+                self._drops.add(entry.target)
                 continue
             first = True
             while True:
@@ -1890,7 +2087,31 @@ class Rewriter(object):
                     while k < len(positions) and positions[k] < nxt:
                         k += 1
             index = self._translate_step(index, out, runs, shape, close_merges)
+        self._resolve_handler_targets(out)
         return out
+
+    def _resolve_handler_targets(self, instructions):
+        """Point a setup at the first surviving instruction of its handler.
+
+        A bare ``finally`` loses its ``PUSH_EXC_INFO`` during translation, but
+        ``SETUP_FINALLY`` still names that address.  The reader rounds missing
+        targets forward; the CFG requires an exact target, so without resolving
+        the head it loses the entire region and reads its clause as an ``else``.
+        Keep instruction addresses intact: other jumps may still name them.
+        """
+        offsets = {instr.offset for instr in instructions}
+        targets = {}
+        for head in self._handler_heads & self._drops:
+            if head in offsets:
+                continue
+            for instr in instructions:
+                if instr.offset > head:
+                    targets[head] = instr.offset
+                    break
+        for instr in instructions:
+            if instr.opname == 'SETUP_FINALLY' and instr.argval in targets:
+                instr.argval = targets[instr.argval]
+                instr.argrepr = str(instr.argval)
 
     def _close_merge_offsets(self):
         """Map each protected-region close offset to the point past its handler.
@@ -1935,8 +2156,44 @@ class Rewriter(object):
             # The close is emitted here rather than inside the translation of
             # the instruction, because several opcodes are translated by a
             # branch of their own that never reaches the common tail.
-            out.append(self._make(raw, 'POP_BLOCK', None, None, line_no=None))
+            out.append(self._make(raw, 'POP_BLOCK', None, None, line_no=None,
+                                  offset=self._close_offset(index)))
         return result
+
+    def _close_offset(self, index):
+        """Address the synthesised ``POP_BLOCK`` at *index* should claim.
+
+        3.9 numbered the pop it emitted after a region's last instruction, and a
+        branch can point at the padding right there -- the ``NOP`` this pass
+        drops.  Taking the first dropped address past the anchor keeps such a
+        jump on the ``POP_BLOCK``, which is where the block stack puts it.
+        """
+        raw_list = self.raw
+        if index + 1 < len(raw_list):
+            nxt = raw_list[index + 1]
+            if nxt.offset in self._drops or nxt.opname in _SILENT:
+                return nxt.offset
+        return raw_list[index].offset
+
+    def _emit_block_setups(self, raw, out):
+        """Push the ``SETUP_FINALLY`` instructions that open the block at *raw*.
+
+        ``_place_block_setups`` keys the synthesised block stack by the offset a
+        ``try`` begins at, and several blocks can begin at the same instruction
+        -- the outermost first, which is the order 3.9 pushed them.
+        """
+        targets = self.try_setups.get(raw.offset)
+        if not targets:
+            return
+        empty = getattr(self, 'empty_body_setups', set())
+        for target in targets:
+            out.append(self._make(raw, 'SETUP_FINALLY', raw.offset, target,
+                                  line_no=None))
+            if (raw.offset, target) in empty:
+                # The inner ``try`` body is empty, so 3.9 closed it with a
+                # ``POP_BLOCK`` right after the ``SETUP_FINALLY``.
+                out.append(self._make(raw, 'POP_BLOCK', None, None,
+                                      line_no=None))
 
     def _translate_instruction(self, index, out, runs, shape, close_merges,
                                ignore_drops=frozenset()):
@@ -1970,6 +2227,12 @@ class Rewriter(object):
         if raw.offset in self._drops and raw.offset not in ignore_drops:
             return index + 1
         if raw.offset in self.try_replace:
+            # A nested ``try`` opens its block at the very instruction the
+            # handler rewrite turns into ``DUP_TOP``: the table protects a
+            # clause body, so the outer ``SETUP_FINALLY`` sits on the inner
+            # chain's head.  Taking the replacement alone reads the whole nest
+            # as the flat clause list of one ``try``.
+            self._emit_block_setups(raw, out)
             out.extend(self._make(raw, op, a, v)
                        for op, a, v in self.try_replace[raw.offset])
             return index + 1
@@ -2045,15 +2308,7 @@ class Rewriter(object):
                 raw.arg >> 2, raw.argval,
             ))
             return index + 1
-        if raw.offset in self.try_setups:
-            for target in self.try_setups[raw.offset]:
-                out.append(self._make(raw, 'SETUP_FINALLY', raw.offset,
-                                      target, line_no=None))
-                if (raw.offset, target) in self.empty_body_setups:
-                    # The inner ``try`` body is empty, so 3.9 closed it with a
-                    # ``POP_BLOCK`` right after the ``SETUP_FINALLY``.
-                    out.append(self._make(raw, 'POP_BLOCK', None, None,
-                                          line_no=None))
+        self._emit_block_setups(raw, out)
         if raw.offset in self.with_closes:
             # 3.9 closed the ``with`` block right before the implicit
             # ``__exit__`` call, so the close goes in front of the operands the
@@ -2258,19 +2513,21 @@ class Rewriter(object):
         return runs
 
     def _make(self, raw, opname, arg, argval, line_no=None,
-              synthetic_loop_exit=False):
+              synthetic_loop_exit=False, offset=None):
         """Build one 3.9 :class:`Instruction` standing in for *raw*."""
         if line_no is None:
             line_no = raw.starts_line
+        if offset is None:
+            offset = raw.offset
         return Instruction(
-            offset=raw.offset,
+            offset=offset,
             opcode=raw.opcode,
             opname=opname,
             arg=arg,
             argval=argval,
             argrepr=_repr_of(opname, arg, argval),
             line_no=line_no,
-            is_jump_target=raw.offset in self.jump_targets,
+            is_jump_target=offset in self.jump_targets,
             synthetic_loop_exit=synthetic_loop_exit,
         )
 
@@ -2359,6 +2616,17 @@ class Decompiler311(Decompiler310):
         if handler_start_idx <= try_end_idx or handler_start_idx >= len(instructions):
             return [], None
 
+        if try_end_idx + 1 == handler_start_idx:
+            # Nothing was pasted between the block pop and the handler: every
+            # path that leaves this ``try`` runs the clause and escapes -- a
+            # ``return`` in the body, a ``return`` in the clause -- so there is
+            # no normal path to carry an inline copy and the handler's copy is
+            # the only text the clause ever got.  The 3.9 reader reads the
+            # clause there and resumes past the handler.
+            return super()._collect_finally_body(
+                code, instructions, try_end_idx, handler_start_idx
+            )
+
         start = try_end_idx + 1
 
         # 3.9 uses a jump to close the inline copy; 3.11/3.12 don't always
@@ -2401,17 +2669,13 @@ class Decompiler311(Decompiler310):
     def _handler_end(
         self, instructions, handler_start_idx: int
     ) -> int:
-        """Index just past the handler.
+        """Use the branch-aware boundary of the translated handler.
 
-        The handler ends at the re-raise or at whatever leaves the function.
+        A conditional ``return`` only ends one path through the clause.  The
+        base reader follows its other branch to the final re-raise, so the
+        remaining handler copy is not emitted again after the ``finally``.
         """
-        n = len(instructions)
-        for j in range(handler_start_idx, n):
-            if instructions[j].opname in ("RERAISE", "RETURN_VALUE"):
-                return j + 1
-            if instructions[j].opname in ("SETUP_FINALLY", "SETUP_EXCEPT"):
-                return j
-        return n
+        return super()._handler_end(instructions, handler_start_idx)
 
     def _finally_clause_length(
         self, instructions, handler_start_idx: int
