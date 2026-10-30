@@ -17,6 +17,10 @@ from .errors import DecompilationError
 #: of inventing one.
 _NOT_AN_ASSERT = object()
 
+#: Stands in for an argument a copied ``finally`` clause cannot reproduce: its
+#: jumps are relocated into the copy's own layout, so only their opcode matters.
+_ANY_ARG = object()
+
 
 def _as_missing_bound(node):
     """``None`` for a slice bound the source omitted, else *node* unchanged.
@@ -958,6 +962,15 @@ class Decompiler:
                         instructions, j, merge_target, fallback_reraise_idx
                     ):
                         merge_cut = except_idx
+                    elif (merge_target is not None
+                          and merge_target < instructions[except_idx].offset
+                          and self._match_loop_jump(merge_target) is None):
+                        # The clause exits by jumping *back* to an inline copy
+                        # of the enclosing ``finally``, which 3.11+ parks in
+                        # front of the handler instead of after it.  The copy
+                        # belongs to the statement that reads it, so the clause
+                        # stops at ``POP_EXCEPT`` and the jump is not emitted.
+                        merge_cut = except_idx
                     break
                 elif self._epilogue_folded_into_clause(
                         instructions, j, raw_end):
@@ -1325,6 +1338,14 @@ class Decompiler:
         exit_idx = try_end_idx + 1
         if exit_idx < handler_start_idx:
             exit_instr = instructions[exit_idx]
+            if exit_instr.opname == "POP_BLOCK":
+                # Two blocks close back to back: the statement is a
+                # ``try``/``except``/``finally``, whose ``except`` block the
+                # compiler popped just before the enclosing ``finally``'s.
+                # Nothing was written between the chain and the clause, so
+                # there is no ``else`` -- what follows the second pop is the
+                # ``finally`` clause belonging to the enclosing block.
+                return []
             if (exit_instr.opname in ("JUMP_FORWARD", "JUMP_ABSOLUTE")
                     and self._jump_target(exit_instr) < exit_instr.offset):
                 # The body already left through a loop back edge.  The gap
@@ -1529,11 +1550,16 @@ class Decompiler:
                         "JUMP_IF_FALSE_OR_POP", "JUMP_IF_TRUE_OR_POP",
                         "JUMP_IF_NOT_EXC_MATCH", "JUMP_IF_NOT_EG_MATCH")
 
+    #: Instructions whose argument is a code address.  A copied clause has its
+    #: jumps relocated to the copy's own layout, so their arguments say nothing
+    #: about whether the two runs are the same code; every other argument does.
+    _ADDRESS_OPS = _JUMP_OPNAMES
+
     def _clause_ops(
         self, instructions: List[Instruction], handler_start_idx: int,
         clause_len: int,
-    ) -> List[str]:
-        """Opnames of the ``finally`` clause as the handler spells it.
+    ) -> List[Tuple[str, Any]]:
+        """``(opname, argument)`` of the ``finally`` clause as the handler spells it.
 
         The handler runs with the exception still on the value stack, so where
         the clause leaves -- a ``return`` out of the middle of it -- the compiler
@@ -1543,7 +1569,7 @@ class Decompiler:
         match then stopped one instruction short and the exit's own ``LOAD`` was
         hidden as clause content, turning ``return -1`` into ``return``.
         """
-        ops: List[str] = []
+        ops: List[Tuple[str, Any]] = []
         t = 0
         while t < clause_len:
             index = handler_start_idx + t
@@ -1556,10 +1582,24 @@ class Decompiler:
                        in ("POP_TOP", "POP_EXCEPT", "END_FINALLY")):
                     t += 1
                 continue
-            ops.append(name)
+            ops.append(self._pattern_item(instructions, index))
             t += 1
         return ops
-        return ops
+
+    @staticmethod
+    def _pattern_item(instructions: List[Instruction], index: int):
+        """The ``(opname, argument)`` a copy of the clause must reproduce.
+
+        A copy is verbatim, so its constants and names are compared along with
+        the opnames -- an enclosing ``finally`` whose clause happens to start
+        with the same opcodes (``print('...')`` in front of ``print('...')``)
+        is different text, not an escape copy of this one.  Jumps are exempt:
+        each copy relocates its own.
+        """
+        instr = instructions[index]
+        if instr.opname in Decompiler._ADDRESS_OPS:
+            return (instr.opname, _ANY_ARG)
+        return (instr.opname, instr.argval)
 
     def _inline_clause_end(
         self, instructions: List[Instruction], start: int, handler_start_idx: int,
@@ -1588,7 +1628,12 @@ class Decompiler:
             if h_name == "EXTENDED_ARG":
                 h += 1
                 continue
-            if self._is_exc_drain(instructions, h):
+            if self._is_exc_drain(instructions, h) \
+                    and instructions[i].opname != "POP_TOP":
+                # A drain the inline run also spells -- the ``POP_TOP`` /
+                # ``POP_EXCEPT`` of an ``except`` clause written *inside* the
+                # ``finally`` -- is clause text on both sides, not an unwind
+                # marker, so it is compared rather than stepped over.
                 while (h < n and instructions[h].opname in
                        ("POP_TOP", "POP_EXCEPT", "END_FINALLY")):
                     h += 1
@@ -1603,21 +1648,25 @@ class Decompiler:
         return min(i, handler_start_idx), False
 
     def _is_exc_drain(self, instructions: List[Instruction], index: int) -> bool:
-        """Is ``POP_TOP`` at *index* the head of an exception-stack drain?"""
+        """Is ``POP_TOP`` at *index* the head of an exception-stack drain?
+
+        3.9 drained with three ``POP_TOP``s -- the value, the traceback and the
+        exception itself -- while 3.11 and later keep the exception info apart
+        and drain with a single one.  Both end in ``POP_EXCEPT``, which no
+        source statement ever emits, so that is the marker.
+        """
         if instructions[index].opname != "POP_TOP":
             return False
-        run = 0
         j = index
         while j < len(instructions) and instructions[j].opname == "POP_TOP":
-            run += 1
             j += 1
-        return (run >= 2 and j < len(instructions)
+        return (j < len(instructions)
                 and instructions[j].opname in ("POP_EXCEPT", "END_FINALLY"))
 
     def _copy_pattern(
         self, instructions: List[Instruction], start: int, cap: int = 48
-    ) -> Tuple[List[str], int]:
-        """Opname sequence of the ``finally`` copy that begins at *start*.
+    ) -> Tuple[List[Tuple[str, Any]], int]:
+        """``(opname, argument)`` sequence of the ``finally`` copy at *start*.
 
         A copy ends where control leaves the clause -- an unconditional jump or
         a ``return`` at the top level.  A ``return`` guarded by one of the
@@ -1628,7 +1677,7 @@ class Decompiler:
         meaning of its own here.
         """
         n = len(instructions)
-        pat: List[str] = []
+        pat: List[Tuple[str, Any]] = []
         j = start
         resume: Optional[int] = None
         while j < n and len(pat) < cap:
@@ -1643,20 +1692,23 @@ class Decompiler:
                     if op in self._COPY_BRANCH_OPS:
                         resume = self._find_target_idx(
                             instructions, self._jump_target(instructions[j]))
-                pat.append(op)
+                pat.append(self._pattern_item(instructions, j))
             j += 1
         return pat, j
 
     def _copy_matches(
-        self, instructions: List[Instruction], at: int, pat: List[str]
+        self, instructions: List[Instruction], at: int,
+        pat: List[Tuple[str, Any]],
     ) -> Optional[int]:
         """Index just past the copy of *pat* starting at *at*, or ``None``."""
         n = len(instructions)
         j = at
-        for want in pat:
+        for want_name, want_arg in pat:
             while j < n and instructions[j].opname == "EXTENDED_ARG":
                 j += 1
-            if j >= n or instructions[j].opname != want:
+            if j >= n or instructions[j].opname != want_name:
+                return None
+            if want_arg is not _ANY_ARG and instructions[j].argval != want_arg:
                 return None
             j += 1
         return j

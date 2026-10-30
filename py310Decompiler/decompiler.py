@@ -1505,6 +1505,25 @@ class Decompiler:
             code, instructions, is_module=False, start=start, end=end,
             out_stack=[],
         )
+        if not body and length:
+            # The inline copy sits inside a range the reader has already
+            # consumed: an ``except`` clause that leaves through the
+            # ``finally`` of the ``try`` enclosing it has its copy of the
+            # clause inside the handler chain.  The handler itself holds a
+            # verbatim copy, so read it there and resume past the handler --
+            # the same reading a ``try`` with no normal path gets.
+            tail = self._handler_end(instructions, handler_start_idx)
+            body = self._emit_statements(
+                code, instructions, is_module=False,
+                start=handler_start_idx, end=tail, out_stack=[],
+            )
+            self._handled_ranges.append((handler_start_idx, tail))
+            while body and (
+                isinstance(body[-1], (ast.Pass, ast.Raise))
+                or _is_bare_return(body[-1])
+            ):
+                body.pop()
+            return body, tail
         # The handler -- and, when a nested ``finally`` unwinds through it, its
         # prologue -- is not source.  Mark it only *after* the inline copy has
         # been read: the prologue range reaches back over the copy, so marking

@@ -1,12 +1,121 @@
 # 项目缺陷清单（bugs.md）
 
-> 最后更新：2026-10-28。状态含义：
+> 最后更新：2026-10-30。状态含义：
 > **已修复** / **部分修复** / **未修复** / **不适用**。
 > 复现与验证命令见文末。
 
 ---
 
-## 2026-10-28 修复摘要
+## 2026-10-30 修复摘要
+
+| 命令 | 修复前 | 修复后 |
+|------|--------|--------|
+| CONTROL FLOW | 72/77 | **77/77** |
+| ROUND-TRIP | 232/263 | **234/263**（无回退） |
+| `main.py decompile boom.pyc`（3.9） | 只剩循环体前两句 | ROUND-TRIP **identical**、AST 与源码 **identical** |
+
+| # | 缺陷 | 影响版本 | 根因 / 修法 |
+|---|------|----------|-------------|
+| E | `try/finally` 的子句被读成 `pass`，`try` 之后的语句一起丢失 | 3.10 | `flow_finally_return`：`except` 子句用 `return` 离开时，外层 `finally` 的内联副本落在**整条 except 链的已消费区间** `(17, 32)` 里，`_parse_except_handlers` 把这段标进了 `_handled_ranges`；随后外层 `_collect_finally_body` 去读内联副本（25..28），`_emit_statements` 返回空，子句就成了 `pass`。现在在「量出了子句长度却一句没读出来」时改读 handler 里的那份逐字副本，并从 handler 之后续读——与 handler 无正常路径时（B 项）的读法一致。`py310Decompiler/decompiler.py:1504`。+1 |
+
+改动只在 `py310Decompiler/decompiler.py`。3.11–3.15 的 `flow_finally_return` 走的是
+`decomp311` 的异常表通道，本次未触碰，也未验证移植（移植前需单独跑四版本门禁）。
+
+| F | `boom.pyc`（3.9）六处控制流全塌：`continue`/`break` 退化成 `while True`，内层 `try/except as/finally` 与三层嵌套 `finally` 整段丢失 | 3.9 | 见下节，5 处独立根因，现已 ROUND-TRIP **逐字节一致**、AST 与源码**逐字一致** |
+
+| G | `flow_nested_finally_reraise` 塌成 `for …: pass` + 假 `else: while True: pass`；`flow_try_except_else_finally`、`flow_finally_return` 的 `finally` 子句读成 `pass` | 3.12–3.15 | 见「`flow_nested_finally_reraise`（3.12–3.15）」一节，10 处改动，CONTROL FLOW 现 **77/77** |
+
+### `boom.pyc`（3.9）五处根因
+
+`main.py decompile boom.pyc` 原先只吐出循环体的前两句。逐个定位：
+
+1. **跳转瞄准了被合并掉的 `EXTENDED_ARG`。** `disassembler._merge_extended_args`
+   把前缀折进后一条指令、后一条保留自己的地址，而 `dis` 解出来的 `argval` 仍指前缀
+   那条被删掉的地址：循环头记成 14，回边却是 `JUMP_ABSOLUTE 12`，`continue` 对不上
+   任何头，被读成新的 `while True`。现在 `_resolve_extended_targets`
+   （`py39Decompiler/disassembler.py:148`）在合并之后把这类目标向后取整到下一条存活
+   指令，一次性喂给所有按偏移比较的读者（`_match_loop_jump`、`_inline_copy_back_edge`、
+   `_emit_for_else`、`_emit_conditional`、`SETUP_FINALLY` 的 handler 头都受益）。
+2. **出口前的 `finally` 副本没被藏住。** `_hide_escape_copies` 认定「副本之后就是出口」，
+   但 `with`/内层 `try` 的卸载排在副本与真正的 `break`/`continue` 之间。新增
+   `_past_teardown`（`decompiler.py:1666`）跨过这段卸载（遇分支标签即停），并把紧跟
+   `RERAISE` 的副本也判为展开路径——子句跑完就往上抛，绝不是源码写法。
+3. **副本只藏了模式窗口那么长。** 子句里含 `try` 时，3.9 把这条 `try` 的 handler 也
+   一起贴在每个出口上；`_copy_matches` 只按子句长度截窗，窗口之外的嵌套 handler 就
+   被读成第二份同样的子句（`deep`/`deepest` 重复三次即此）。`_copy_handler_end`
+   （`decompiler.py:1691`）沿副本内的 `SETUP_*` 推到其 handler 的最后一个 `RERAISE`，
+   整个尾巴一起标掉。同一规则补进了 `_handler_end`：handler **第一条**就是
+   `SETUP_FINALLY` 时原先直接 `return j`（空区间），子句因此在源码之后重演一遍。
+4. **循环体被两条回边切成两句。** `with` 收尾会闭合循环两次——正常路径一次、异常
+   路径经 handler 再一次，编译器把正常那次写在前面，中间只剩卸载。原先只认最右一条，
+   左边那条就成了没人写的 `continue`。`_first_loop_close`（`decompiler.py:5759`）在
+   回边之前全是卸载类指令时改用最左一条定界。
+5. **`if trigger: pass` 被整个丢掉。** `_emit_conditional` 见到「then/else 都空」就
+   直接跳过；而这种分支落在紧跟其后的那条指令上，正是 3.9 编译空体 `if` 的唯一形态，
+   测试表达式仍然进字节码。`decompiler.py:5613` 起补出 `if cond: pass`。
+
+第 1 项对七个后端的 `disassembler.py` 是同构的（都跑 `_merge_extended_args`），本轮只改了
+3.9 那份并单独复验；其余四项在 3.10+ 的 `decompiler.py` 副本里同样存在，但 3.10/3.11/3.14
+对 `boom.py` 还有各自的其它缺陷（`None(None, None, None)` 一类的 `__exit__` 误读），
+未一并移植。
+
+### `flow_nested_finally_reraise`（3.12–3.15）根因定位
+
+3.11 已通过，3.12 起失败，差异在**布局**而不是规则：
+
+* 3.11 把 `for` 循环内层 `try` 的 handler 放在循环体内，循环出口是一条
+  `JUMP_FORWARD`（`FOR_ITER` 精确指向它），`try` 语句之后的代码排在所有 handler 之后。
+* 3.12 的 `FOR_ITER` 指向 `END_FOR`（被 `DROPPED` 删掉，reader 向后取整，CFG 要求精确），
+  而内层 `try` 的两个 handler（`-> 164`、`-> 222`）被整体外提到循环出口**之后**、
+  `try` 语句之后那段代码（128..162，外层 `finally` 的内联副本 + `return 0`）的**后面**。
+
+于是合成流里 `SETUP_FINALLY`（off 66 → 222）的 handler 落在循环区间之外，reader 认不出
+这个块，循环体塌成 `for i in range(x): pass`，内层子句被当成循环之后的顺序代码重读，
+并多出一个假的 `else: while True: pass`。
+
+**落地的修法**（3.12/3.13 一套，3.14/3.15 再加一条 reader 规则；四份
+`decomp311.py` + `decompiler.py` 逐锚点移植，未整文件覆盖）：
+
+1. **`Rewriter._live_offset`**：区域名下的 handler 头可能正是被本 pass 删掉的
+   `PUSH_EXC_INFO`（`finally` 清理段的第一条）。把 `SETUP_FINALLY` 的目标改成它
+   存活成的那条指令，否则 reader 与 CFG 拿到一个不属于任何指令的地址，块匹配不上，
+   `POP_BLOCK` 被算到更内层的块上，整个 `try` 少读一层。
+2. **`Rewriter._share_body_close` + `close_extras` / `_fresh_offset`**：一条语句把
+   几个块压在同一条指令上，3.9 在体末逐个 `POP_BLOCK` 连着弹；异常表只在最内层
+   handler 上点名一次体的末尾，外层块的弹法被送到自己 handler 之前——那位置在循环
+   **之外**，reader 于是把循环体算到那条 `POP_BLOCK` 就结束，整条 `try` 消失。现在
+   把这些弹法重新锚到共享的体末，并按压栈顺序补发额外的 `POP_BLOCK`，每条分配一个
+   不与真实指令重合的地址（分支只能瞄准第一条）。
+3. **`Rewriter._place_one_close`**：`nested` 只看 `with` 之外的嵌套 handler 目标；
+   起始落在展开桩（`COPY`/`POP_EXCEPT`/`RERAISE`）里的 span 不计入体末；回退找锚点
+   时跳过 `DROPPED` 与 `NOP`；同一锚点被两个块共用时走 `close_extras` 而不是抢占地址。
+4. **reader 的副本匹配带上参数**（`_ANY_ARG` / `_pattern_item` / `_ADDRESS_OPS`）：
+   子句副本是逐字的，常量名与变量名也要比；只有跳转豁免——每份副本重定位自己的目标。
+   外层 `finally` 的子句恰好与内层子句同头（都是 `print('…')`）时，光比 opname 会把
+   两份不同文本认成同一子句。
+5. **`_inline_clause_end` 的排空守卫**：内联段也写出来的那份排空（`POP_TOP` /
+   `POP_EXCEPT`）是两侧共同的子句正文，要参与比较，不能被当展开标记跨过去。
+6. **`_is_exc_drain`**：3.11 之后排空只剩一条 `POP_TOP`，紧跟 `POP_EXCEPT`。
+7. **`_recover_else_clause`**：两条 `POP_BLOCK` 背靠背时（`except` 块先弹、外层
+   `finally` 块后弹），中间没有 `else` 可写。
+8. **`Decompiler311._collect_finally_body`**：块弹法落在 `else` 体末时，紧跟其后的
+   是 `except` 链而不是子句，两侧一步就分道；此时改从 `SETUP_FINALLY` 指向的那份副本
+   读子句并从其后续读。
+9. **`Decompiler311._handler_end`** 交回共享走法：handler 到传播异常的 `RERAISE`
+   结束，而不是第一个 `RETURN_VALUE`——会 return 的子句在不 return 的那条路上仍要重抛。
+10. **3.14/3.15 独有**：`_parse_handler_body` 里，子句以「向后跳」离开时（3.11+ 把外层
+    `finally` 的内联副本停在 handler **前面**，跳的是那份副本），只要目标小于
+    `POP_EXCEPT` 的偏移且对不上任何循环回边，子句就止于 `POP_EXCEPT`、这条跳转不输出。
+    两条改动没有动 `_analyse_handlers` 里的 `loop_cleanup` 启发式——它在本案仍会误触
+    （把名字清理当成循环收尾丢掉），但读者现在能把丢掉的结构读回来。
+
+结果：CONTROL FLOW **77/77**（3.12/3.13/3.14/3.15 各 11/11），ROUND-TRIP
+232/263 → **234/263**（新增 `probe_retfinally` 在 3.14、3.15 两例），其余失败与
+本轮无关（`probe_exceptions`、`probe_cls`、`probe_classkw` 等既有缺陷）。
+3.14 组 40/48、3.15 组 38/48；3.15 的 `probe_yield`/`probe_yieldexpr` 仍是 3.15
+自身的旧缺陷，未在本次范围内。
+
+---
 
 起点是上一轮留下的 41/77（HEAD 的重写器 + 当前工作树），本轮验证节点：
 41 → **49** → **55** → **56**。全部改动仍未提交，也未推送。
@@ -544,7 +653,11 @@ def first():
 ## 验证命令
 
 ```
-python -m tests.run                 # ROUND-TRIP 232/263、CONTROL FLOW 56/77（仍有已有失败）
+embed_python/python-3.12/python.exe tests/run.py   # ROUND-TRIP 234/263、CONTROL FLOW 77/77
+embed_python/python-3.14/python.exe tests/run.py   # 同一命令，任一版本作宿主都会扇出全部七组
+# 单版本组（换掉三处版本号即可）：
+BYTECODE2CODE_TESTS_GROUP=3.14 BYTECODE2CODE_TESTS_OUT=_scratch/g314.json \
+  embed_python/python-3.14/python.exe tests/run.py
 python -m tests.test_cfg            # 3.9：15 项通过，3 项 3.11 专项跳过
 embed_python/python-3.11/python.exe tests/test_cfg.py Rewriter311Tests  # 3 项通过
 # 七版本分别执行下面的输出回归（将 3.10 替换为对应版本）：

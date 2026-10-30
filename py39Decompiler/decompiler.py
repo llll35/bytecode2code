@@ -1665,6 +1665,57 @@ class Decompiler:
             j += 1
         return j
 
+    def _past_teardown(
+        self, instructions: List[Instruction], probe: int, limit: int
+    ) -> int:
+        """Advance past the block unwinding that follows a ``finally`` copy.
+
+        An exit written inside a ``with`` or an inner ``try`` does not leave on
+        the instruction after the clause copy: 3.9 first runs the teardown of
+        every block the exit leaves, and the ``break`` or ``return`` sits past
+        all of it.  The walk stops at anything that can begin a path -- a branch
+        label as well as a re-raise or a jump -- so a stretch of body code that
+        merely has the clause's shape is not read as teardown.
+        """
+        n = len(instructions)
+        for j in range(probe, min(n, probe + limit)):
+            instr = instructions[j]
+            if instr.opname not in self._UNWIND_OPS or instr.is_jump_target:
+                return j
+        return min(probe + limit, n)
+
+    #: Opcodes that push a block whose handler is emitted after the range.
+    _COPY_SETUP_OPS = ("SETUP_FINALLY", "SETUP_EXCEPT", "SETUP_WITH",
+                       "SETUP_ASYNC_WITH", "SETUP_LOOP")
+
+    def _copy_handler_end(
+        self, instructions: List[Instruction], start: int, end: int
+    ) -> int:
+        """Index just past a ``finally`` copy's own nested handlers.
+
+        A clause that contains a ``try`` is pasted at an exit together with the
+        handlers of the blocks inside it: 3.9 writes the whole statement -- body,
+        inline clause, handler chain -- so the copy is not over until the last
+        re-raise of that chain.  Hiding only the window the clause pattern
+        matched leaves a nested handler in the stream, where the reader picks it
+        up as a second copy of the clause.
+        """
+        n = len(instructions)
+        frontier = end
+        j = start
+        while j < frontier and j < n:
+            instr = instructions[j]
+            if instr.opname in self._COPY_SETUP_OPS:
+                target = self._find_target_idx(instructions, _jump_target(instr))
+                if target >= frontier:
+                    frontier = max(target + 1,
+                                   self._handler_end(instructions, target))
+            j += 1
+        while frontier + 1 < n and instructions[frontier].opname == "RERAISE" \
+                and instructions[frontier - 1].opname == "RERAISE":
+            frontier += 1
+        return frontier
+
     def _hide_escape_copies(
         self,
         instructions: List[Instruction],
@@ -1730,14 +1781,20 @@ class Decompiler:
             # there the leave must follow it directly, or the run is body code
             # that merely looks like the clause -- ``try: g() finally: h()`` is
             # the same three instructions either way.
-            escapes = self._return_after_unwind(
-                instructions, probe, limit=6 if at_pop else 2) is not None
+            probe = self._past_teardown(instructions, probe, 24 if at_pop else 2)
+            # A copy closed by a re-raise runs the clause and then lets the
+            # exception carry on: 3.9 pasted it where an unwind passes through
+            # the ``finally``, which is never what the source says.
+            escapes = probe < n and instructions[probe].opname in (
+                "RETURN_VALUE", "RERAISE")
             if not escapes and probe < n and instructions[probe].opname in (
                     "JUMP_ABSOLUTE", "JUMP_FORWARD"):
                 escapes = isinstance(self._classify_jump(
                     instructions, instructions[probe]), (ast.Break, ast.Continue))
             if escapes:
-                self._handled_ranges.append((copy_start, k))
+                self._handled_ranges.append(
+                    (copy_start,
+                     self._copy_handler_end(instructions, copy_start, k)))
 
     def _inline_copy_back_edge(
         self,
@@ -1837,6 +1894,13 @@ class Decompiler:
         for j in range(handler_start_idx, n):
             op = instructions[j].opname
             if op in ("SETUP_FINALLY", "SETUP_EXCEPT"):
+                if j == handler_start_idx:
+                    # The clause itself begins with a ``try``, so the handler copy
+                    # opens with that ``try``'s block setup.  The region then runs
+                    # to the last re-raise of the nested chain; stopping here
+                    # would mark an empty handler and leave the copy to be read as
+                    # source a second time after the clause.
+                    return self._copy_handler_end(instructions, j, j + 1)
                 return j
             if resume is not None and j >= resume:
                 resume = None
@@ -5547,6 +5611,11 @@ class Decompiler:
                 code, instructions, is_module=False, start=else_start, end=else_end
             )
         if not body_stmts and not else_stmts and not is_module:
+            if body_start == body_end == target_idx and else_start is None:
+                # The branch skips nothing: it lands on the instruction right
+                # behind it, which is how 3.9 compiles an ``if`` whose body is
+                # ``pass``.  Dropping it loses the test the bytecode still runs.
+                stmts.append(ast.If(test=cond, body=[ast.Pass()], orelse=[]))
             return max(1, end_idx - idx)
         stmts.append(
             ast.If(test=cond, body=body_stmts or [ast.Pass()], orelse=else_stmts)
@@ -5680,6 +5749,44 @@ class Decompiler:
                 return None
         return None
 
+    #: Opcodes that can sit between the two closes of one loop body.
+    _CLOSE_TAIL_OPS = frozenset((
+        "POP_BLOCK", "POP_EXCEPT", "POP_TOP", "DUP_TOP", "ROT_TWO", "ROT_THREE",
+        "ROT_FOUR", "NOP", "RERAISE", "WITH_EXCEPT_START", "END_FINALLY",
+        "POP_JUMP_IF_FALSE", "POP_JUMP_IF_TRUE",
+    ))
+
+    def _first_loop_close(
+        self,
+        instructions: List[Instruction],
+        loop_idx: int,
+        body_start: int,
+        edge: int,
+    ) -> int:
+        """Leftmost jump that closes the body, when the tail is only teardown.
+
+        A ``with`` or a ``try`` that ends a loop body closes the loop twice --
+        once on the normal path and once from the handler the exception path
+        runs -- and the compiler writes the normal-path jump first, with nothing
+        but block teardown between the two.  The body ends there; stopping only
+        at the last jump leaves the earlier one to read as a ``continue``.
+        """
+        head = instructions[loop_idx].offset
+        j = edge
+        while j - 1 >= body_start:
+            j -= 1
+            ins = instructions[j]
+            if ins.opname in ("JUMP_ABSOLUTE", "JUMP_FORWARD"):
+                jump_to = int(
+                    ins.argval if ins.argval is not None else (ins.arg or 0))
+                if jump_to != head:
+                    break
+                edge = j
+                continue
+            if ins.opname not in self._CLOSE_TAIL_OPS:
+                break
+        return edge
+
     def _find_loop_body_end(
         self,
         instructions: List[Instruction],
@@ -5712,7 +5819,8 @@ class Decompiler:
         if back_edge is None:
             return end_idx
         if back_edge == end_idx - 1:
-            return back_edge
+            return self._first_loop_close(
+                instructions, loop_idx, body_start, back_edge)
         tail = self._find_duplicated_tail(instructions, back_edge, end_idx)
         return tail if tail is not None else end_idx
 

@@ -446,6 +446,7 @@ class Rewriter(object):
         self.with_setups, self.with_closes, self.with_swaps, \
             self.with_exits = self._analyse_with()
         self.try_setups, self.try_closes = self._analyse_try()
+        self._raw_offsets = {raw.offset for raw in self.raw}
         self.supers = self._analyse_super()
         self.comprehensions = self._analyse_comprehensions()
         self._analyse_tuple_generator_optimisations()
@@ -1092,6 +1093,8 @@ class Rewriter(object):
         inner.with_exits = set()
         inner.try_setups = {}
         inner.try_closes = {}
+        inner.close_extras = {}
+        inner._close_owner = {}
         inner.try_before = {}
         inner.try_replace = {}
         inner.name_closes = {}
@@ -1758,13 +1761,68 @@ class Rewriter(object):
         """
         raw_list = self.raw
         entries = _exception_entries(self.code)
+        self._close_owner = {}
+        self.close_extras = {}
         for begins, targets in setups.items():
             for target in targets:
                 self._place_one_close(entries, raw_list, begins, target,
                                       closes)
+        self._share_body_close(entries, setups, raw_list, closes)
         self._place_exit_closes(entries, raw_list, closes)
         for key in [k for k in closes if k in self.with_closes]:
             del closes[key]
+
+    def _share_body_close(self, entries, setups, raw_list, closes):
+        """Pop every block of one statement at the end of its body.
+
+        ``try: ... except: ... finally: ...`` pushes its blocks on the same
+        instruction, and 3.9 popped all of them at the end of the body, one
+        right behind the other, before the inline clause.  The table names the
+        body's end once -- against the innermost handler -- and sends the
+        enclosing block's pop to the front of its own handler instead, which
+        sits *outside* any loop the statement is nested in.  The reader then
+        counts the loop body as ending at the outer pop and loses the whole
+        ``try``.  Re-anchor those pops on the shared body end, repeating the
+        ``POP_BLOCK`` for each block the setups pushed.
+        """
+        for begins, targets in setups.items():
+            if len(targets) < 2:
+                continue
+            inner = targets[-1]
+            anchor = next((offset for offset, owner
+                           in self._close_owner.items() if owner == inner),
+                          None)
+            if anchor is None:
+                continue
+            others = [offset for offset, owner in self._close_owner.items()
+                      if owner in targets and owner != inner]
+            if any(offset < inner for offset in others):
+                # One of the blocks closes inside the statement's own body,
+                # before the inner handler takes over -- an ``else`` clause
+                # sits between the two pops, so they do not share an end.
+                continue
+            # 3.9 popped the enclosing block on the way out of the chain, past
+            # the handlers, and the inline clause follows the jump that got
+            # there.  3.11 and later keep the clause right behind the body
+            # instead, with no jump to tell them apart, so the close belongs
+            # there with the body's own.
+            index = self._offset_index(anchor)
+            if index is None:
+                continue
+            index += 1
+            while index < len(raw_list) and raw_list[index].offset in self._drops:
+                index += 1
+            if index < len(raw_list) and raw_list[index].opname in (
+                    "JUMP_FORWARD", "JUMP_ABSOLUTE"):
+                continue
+            for target in targets:
+                if target == inner:
+                    continue
+                for offset in [o for o, owner in self._close_owner.items()
+                               if owner == target]:
+                    del closes[offset]
+                    del self._close_owner[offset]
+            self.close_extras[anchor] = len(targets) - 1
 
     def _place_exit_closes(self, entries, raw_list, closes):
         """Anchor a ``POP_BLOCK`` in front of every other copy of a clause.
@@ -1852,6 +1910,9 @@ class Rewriter(object):
         if anchor in closes or anchor in self.with_closes:
             return
         closes[anchor] = target
+        owner = getattr(self, "_close_owner", None)
+        if owner is not None:
+            owner[anchor] = target
 
     def _clause_shape(self, raw_list, h_idx):
         """The ``(opname, argval)`` pairs the handler at *h_idx* runs.
@@ -1894,11 +1955,17 @@ class Rewriter(object):
         # after it are that handler's unwinding code, which the table sends
         # here as well.
         nested = [e.target for e in entries
-                  if e.target != target and start < e.target <= target
-                  and e.target in self.with_targets]
+                  if e.target != target and start < e.target <= target]
         limit = min(nested) if nested else target
+        stub_starts = {low for low, _ in self._unwind_stubs(entries)}
         spans = [e for e in entries
-                 if e.target == target and start <= e.start < limit]
+                 if e.target == target and start <= e.start < limit
+                 # A span that starts inside an unwinding stub -- the
+                 # ``COPY``/``POP_EXCEPT``/``RERAISE`` a handler installs --
+                 # reaches the handler from a path that already left the body.
+                 # Counting it would put the close in front of the handler
+                 # instead of at the end of the body the source wrote.
+                 and e.start not in stub_starts]
         if not spans:
             # Nothing the table protects for this handler begins before the
             # nested block that shares it: the outer ``try``'s whole body *is*
@@ -1919,16 +1986,30 @@ class Rewriter(object):
         if index is None:
             index = len(raw_list)
         stubs = self._unwind_stubs(entries)
+        # A ``NOP`` the compiler parked at the region's end is dropped on the
+        # way to the reader, so a close keyed on it would never be emitted.
         while index > 0 and (raw_list[index - 1].offset in self._drops
+                             or raw_list[index - 1].opname in DROPPED
+                             or raw_list[index - 1].opname == 'NOP'
                              or any(lo <= raw_list[index - 1].offset < hi
                                     for lo, hi in stubs)):
             index -= 1
         if index == 0:
             return
         close_at = raw_list[index - 1].offset
-        if close_at in closes or close_at in self.with_closes:
+        if close_at in self.with_closes:
+            return
+        if close_at in closes:
+            # Another block of the same statement reaches its end at the same
+            # instruction -- 3.9 popped the blocks stacked on one instruction
+            # back to back, so this one repeats the ``POP_BLOCK`` at that
+            # anchor instead of claiming an address already taken.
+            if self._close_owner.get(close_at) != target:
+                self.close_extras[close_at] = \
+                    self.close_extras.get(close_at, 0) + 1
             return
         closes[close_at] = end
+        self._close_owner[close_at] = target
 
     #: Opcodes that may build the exception type in front of ``CHECK_EXC_MATCH``.
     _TYPE_LOADS = frozenset((
@@ -2509,9 +2590,32 @@ class Rewriter(object):
             # The close is emitted here rather than inside the translation of
             # the instruction, because several opcodes are translated by a
             # branch of their own that never reaches the common tail.
-            out.append(self._make(raw, 'POP_BLOCK', None, None, line_no=None,
-                                  offset=self._close_offset(index)))
+            close = self._make(raw, 'POP_BLOCK', None, None, line_no=None,
+                               offset=self._close_offset(index))
+            out.append(close)
+            # A statement stacks several blocks on one instruction -- the
+            # ``finally`` of ``try``/``except``/``finally`` nests the
+            # ``except`` block -- and 3.9 popped each of them at the end of
+            # the body.  The table names that point once, so the extra pops
+            # are repeated here in the same nesting order.  Each needs an
+            # address of its own: a branch aimed at the close must reach the
+            # first pop only, and a shared address would make the second pop
+            # claim it instead.
+            for _ in range(self.close_extras.get(raw.offset, 0)):
+                extra = self._make(raw, 'POP_BLOCK', None, None, line_no=None)
+                extra.offset = self._fresh_offset(close.offset)
+                out.append(extra)
         return result
+
+    def _fresh_offset(self, start):
+        """An address just past *start* that no real instruction holds."""
+        live = getattr(self, '_raw_offsets', None)
+        if live is None:
+            live = {raw.offset for raw in self.raw}
+        offset = start + 1
+        while offset in live:
+            offset += 1
+        return offset
 
     def _emit_block_setups(self, raw, out):
         """Push the ``SETUP_FINALLY`` instructions that open the block at *raw*.
@@ -2525,13 +2629,37 @@ class Rewriter(object):
             return
         empty = getattr(self, 'empty_body_setups', set())
         for target in targets:
-            out.append(self._make(raw, 'SETUP_FINALLY', raw.offset, target,
-                                  line_no=None))
+            out.append(self._make(raw, 'SETUP_FINALLY', raw.offset,
+                                  self._live_offset(target), line_no=None))
             if (raw.offset, target) in empty:
                 # The inner ``try`` body is empty, so 3.9 closed it with a
                 # ``POP_BLOCK`` right after the ``SETUP_FINALLY``.
                 out.append(self._make(raw, 'POP_BLOCK', None, None,
                                       line_no=None))
+
+    def _live_offset(self, offset):
+        """A table target moved onto the instruction it survives as.
+
+        The handler a region names may be an instruction this pass never emits
+        -- the ``PUSH_EXC_INFO`` a ``finally`` clause's cleanup opens with is
+        dropped, so the handler reads as the ``LOAD_*`` behind it.  Handing the
+        reader and the CFG analyzer an address no instruction has leaves the
+        block unmatched: its ``POP_BLOCK`` is then attributed to the block
+        nested inside it, and the ``try`` is read a level too shallow.
+        """
+        raw_list = self.raw
+        index = self._offset_index(offset)
+        if index is None:
+            index = len(raw_list)
+            for position, raw in enumerate(raw_list):
+                if raw.offset > offset:
+                    index = position
+                    break
+        while index < len(raw_list) and (
+                raw_list[index].offset in self._drops
+                or raw_list[index].opname in DROPPED):
+            index += 1
+        return raw_list[index].offset if index < len(raw_list) else offset
 
     def _translate_instruction(self, index, out, runs, shape, close_merges,
                                ignore_drops=frozenset()):
@@ -3004,20 +3132,101 @@ class Decompiler311(Decompiler310):
             return True
         return super()._is_exc_drain(instructions, index)
 
+    def _collect_finally_body(
+        self, code, instructions, try_end_idx: int, handler_start_idx: int
+    ):
+        """Recover the ``finally`` clause for 3.11+.
+
+        The clause is emitted inline where the protected range ends, once, and
+        the handler holds a copy of it.  The block pop the table yields often
+        lands at the end of an ``else`` body rather than where 3.9 closed both
+        blocks together, so what follows the pop is the ``except`` chain, not
+        the clause: the walk below parts company immediately and the clause
+        has to be read from the copy the setup points at instead.
+        """
+        if handler_start_idx <= try_end_idx or handler_start_idx >= len(instructions):
+            return [], None
+
+        if try_end_idx + 1 == handler_start_idx:
+            # Nothing was pasted between the block pop and the handler: every
+            # path that leaves this ``try`` runs the clause and escapes -- a
+            # ``return`` in the body, a ``return`` in the clause -- so there is
+            # no normal path to carry an inline copy and the handler's copy is
+            # the only text the clause ever got.
+            return super()._collect_finally_body(
+                code, instructions, try_end_idx, handler_start_idx
+            )
+
+        start = try_end_idx + 1
+        if instructions[start].opname in ("JUMP_FORWARD", "JUMP_ABSOLUTE"):
+            # Inline copy closed with a jump; resume after the handler.
+            end = start
+            handler_end = self._handler_end(instructions, handler_start_idx)
+            self._handled_ranges.append((handler_start_idx, handler_end))
+            return [], handler_end
+
+        # Collect the inline finally clause.  The handler holds a copy of it,
+        # so the boundary is where the two copies part company: the handler's
+        # re-raise.
+        h0 = handler_start_idx
+        n = len(instructions)
+        while h0 < n and instructions[h0].opname in self._BLOCK_NOISE:
+            h0 += 1
+        end, clause_ran_out = self._inline_clause_end(instructions, start, h0)
+        if end <= start:
+            if instructions[handler_start_idx].opname == "RERAISE":
+                # The handler is a bare re-raise, so the clause is empty and
+                # the handler holds no copy of it.  What sits between the block
+                # pop and the handler is the code that follows the whole
+                # ``try``, so it is read in place instead of being taken for
+                # clause text.
+                handler_end = self._handler_end(instructions, handler_start_idx)
+                self._handled_ranges.append((handler_start_idx, handler_end))
+                return [], start
+            # The instruction past the block pop is not the clause: every path
+            # that leaves the protected range runs its copy and escapes, so the
+            # compiler wrote no inline copy at all and the handler's copy --
+            # which the setup points at -- is the only text there is.  Read it
+            # there and resume past it.
+            return super()._collect_finally_body(
+                code, instructions, handler_start_idx - 1, handler_start_idx
+            )
+        if not clause_ran_out:
+            end -= self._inline_copy_back_edge(
+                instructions, start, end, h0)
+        length = end - start
+
+        if length or instructions[start].opname != "RETURN_VALUE":
+            resume = end
+        else:
+            # A ``return`` straight after the block pop is the body's own.
+            resume = None
+
+        handler_end = self._handler_end(instructions, handler_start_idx)
+        self._handled_ranges.append((handler_start_idx, handler_end))
+
+        body = self._emit_statements(
+            code, instructions, is_module=False, start=start, end=end,
+            out_stack=[],
+        )
+        while body and (
+            isinstance(body[-1], (ast.Pass, ast.Raise)) or _is_bare_return(body[-1])
+        ):
+            body.pop()
+        return body, resume
+
     def _handler_end(
         self, instructions, handler_start_idx: int
     ) -> int:
         """Index just past the handler.
 
-        The handler ends at the re-raise or at whatever leaves the function.
+        The handler ends at the re-raise that propagates the exception, not at
+        the first ``return``: a clause that can return still runs its copy on
+        the path that does not, and that tail -- the rest of the copy plus the
+        re-raise -- follows the ``return`` inside the same handler.  The shared
+        walk knows how to stay inside the branch guarding such a return.
         """
-        n = len(instructions)
-        for j in range(handler_start_idx, n):
-            if instructions[j].opname in ("RERAISE", "RETURN_VALUE"):
-                return j + 1
-            if instructions[j].opname in ("SETUP_FINALLY", "SETUP_EXCEPT"):
-                return j
-        return n
+        return super()._handler_end(instructions, handler_start_idx)
 
     def _finally_clause_length(
         self, instructions, handler_start_idx: int
