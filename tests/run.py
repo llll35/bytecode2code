@@ -1,4 +1,4 @@
-"""Run the whole suite:  python -m tests.run  [--verbose]
+"""Run the whole suite:  embed_python/python-X.Y/python.exe tests/run.py  [--verbose]
 
 The corpus is ``.pyc`` files, and ``marshal`` has no cross-version
 compatibility, so a sample can only be read by the interpreter it was compiled
@@ -9,9 +9,9 @@ so the comparison is like-for-like, and round-tripping the source-only probes
 as well.  Results come back as JSON and the parent prints one report.
 
 The probes run at *every* version on purpose.  They are the only part of the
-corpus that can exercise each back end (3.9, 3.10, 3.11, 3.12, 3.13 and 3.14 all
-take different paths through the decompiler), and a probe that round-trips on
-one version can still be wrong on another.
+corpus that can exercise each back end (3.9 through 3.15 all take different
+paths through the decompiler), and a probe that round-trips on one version can
+still be wrong on another.
 """
 
 import json

@@ -425,6 +425,9 @@ class Rewriter(object):
         self._drops = set()
         self._drop_loop_teardown()
         self._retarget = {}
+        #: Where a copy of the implicit return was dropped, and the address of
+        #: the copy that stays -- a branch aimed at the former needs the latter.
+        self._epilogue_copies = {}
         self._loop_breaks = {}
         self._handler_heads = set()
         #: 3.14 opens a ``with`` block with ``COPY``/``LOAD_SPECIAL`` instead of
@@ -446,6 +449,7 @@ class Rewriter(object):
         self._mark_dead_handlers()
         self._redirect_handler_exits()
         self._analyse_exception_loop_exits()
+        self._retarget_dropped_epilogues()
 
     def _drop_loop_teardown(self):
         """Drop the pop 3.13 writes right behind ``END_FOR``.
@@ -821,7 +825,14 @@ class Rewriter(object):
                 break
 
     def _analyse_exception_loop_exits(self):
-        """Retarget handler back-edges past dropped loop-head NOPs."""
+        """Retarget handler back-edges past dropped loop-head NOPs.
+
+        Also restores the ``break`` a protected body ends with: 3.12 compiles
+        ``break`` at the end of a ``try`` body into nothing at all -- the region
+        stops at a ``NOP`` and control falls through into the code behind the
+        loop -- so the exit jump has to be named again or the reader never closes
+        the block.
+        """
         raw_list = self.raw
         by_offset = {raw.offset: index for index, raw in enumerate(raw_list)}
         jump_ops = set(dis.hasjabs) | set(dis.hasjrel)
@@ -837,7 +848,9 @@ class Rewriter(object):
                 target = by_offset.get(raw.argval)
                 if target is not None and raw_list[target].opname == 'NOP':
                     loop_heads.add(raw.argval)
-            if not loop_heads:
+            if not loop_heads and not self._handler_reenters_loop(raw_list, entry):
+                # Nothing re-enters the code in front of the region, so the
+                # ``NOP`` behind it is padding, not a ``break``.
                 continue
             for loop_head in loop_heads:
                 target_index = by_offset[loop_head]
@@ -862,6 +875,21 @@ class Rewriter(object):
                 exit_index += 1
             if exit_index < len(raw_list):
                 self._loop_breaks[raw_list[end].offset] = raw_list[exit_index].offset
+
+    def _handler_reenters_loop(self, raw_list, entry):
+        """Whether the clause chain ends by continuing the loop around it.
+
+        The ``loop_heads`` above are the jumps whose dropped ``NOP`` has to be
+        re-aimed; this is the weaker question of whether the region sits in a
+        loop at all.  3.12 lays a ``while`` out so the clause's exit names the
+        body's first instruction rather than the ``NOP`` in front of it, and that
+        jump comes from behind the handler -- where a ``break`` at the end of a
+        protected body left the real exit to be recovered from the table.
+        """
+        jump_ops = set(dis.hasjabs) | set(dis.hasjrel)
+        return any(raw.opcode in jump_ops and isinstance(raw.argval, int)
+                   and raw.argval < entry.start and raw.offset >= entry.target
+                   for raw in raw_list)
 
     def _save_tail_for_merge(self, tail_start, merge_offset):
         """Save tail instructions to be emitted at the merge point.
@@ -1649,11 +1677,15 @@ class Rewriter(object):
         A region can also start *past* the nested block it protects, because an
         exit that already ran the inlined ``finally`` is left out of the table:
         ``try: ... except: ... finally: ...`` protects the clause chain but not
-        the ``return`` that ran the clause.  Any handler dispatch that lies
-        inside the region therefore pulls the start back to its own body, which
-        is where 3.9 pushed that block -- and ours, in front of it.
+        the ``return`` that ran the clause.  That chain is a region of its own
+        and the walk steps back to its body -- where 3.9 pushed that block, and
+        ours in front of it.  Only a chain at our own unwinding depth qualifies:
+        a dispatch we reach across a shallower or deeper region belongs to an
+        earlier, disjoint statement whose body lies behind us, and anchoring at
+        it opens our block around a whole other statement.
         """
         heads = self._table_heads(entries)
+        depth = self._region_depth(entries, start, target)
         begins = start
         while True:
             for entry in entries:
@@ -1661,11 +1693,25 @@ class Rewriter(object):
                     continue
                 if not begins <= entry.target < target:
                     continue
-                if entry.end == begins or entry.target in heads:
+                if entry.end == begins or (entry.target in heads
+                                           and (depth is None
+                                                or entry.depth == depth)):
                     begins = entry.start
                     break
             else:
                 return begins
+
+    def _region_depth(self, entries, start, target):
+        """The unwinding depth the table gives the region we are anchoring.
+
+        ``depth`` counts the handlers already in force, so two regions at the
+        same depth are successive spans of one statement's blocks, and a span at
+        another depth belongs to a block nested inside it or enclosing it.
+        """
+        for entry in entries:
+            if entry.start == start and entry.target == target:
+                return entry.depth
+        return None
 
     def _table_heads(self, entries):
         """Offsets the table dispatches through -- one per ``try`` statement.
@@ -2141,9 +2187,53 @@ class Rewriter(object):
         step = self._return_none_at(index)
         if step is None:
             return
-        self._drops.add(self.raw[step].offset)
+        copied = [self.raw[step].offset]
         if self.raw[step].opname == 'LOAD_CONST':
-            self._drops.add(self.raw[step + 1].offset)
+            copied.append(self.raw[step + 1].offset)
+        self._drops.update(copied)
+        kept = self._kept_copy_before(step)
+        if kept is not None:
+            for offset in copied:
+                self._epilogue_copies[offset] = kept
+
+    def _kept_copy_before(self, step):
+        """Address of the surviving implicit return that the copy at *step* duplicates.
+
+        3.11 lays those copies back to back -- one per protected region, one per
+        clause -- and the scope keeps a single one of them, so the whole run
+        reads as the same two instructions repeated.  The nearest whole copy in
+        front of the one being dropped is therefore the one that stays; where
+        none is left, this copy is the only one and its address is kept as it is.
+        """
+        raw_list = self.raw
+        for position in range(step - 1, -1, -1):
+            if self._return_none_at(position) != position:
+                continue
+            if raw_list[position].offset in self._drops:
+                continue
+            if raw_list[position].opname == 'LOAD_CONST' \
+                    and raw_list[position + 1].offset in self._drops:
+                continue
+            return raw_list[position].offset
+        return None
+
+    def _retarget_dropped_epilogues(self):
+        """Re-aim the branches that skipped to a copy this pass deleted.
+
+        A conditional jump guarding the last statement of a scope skips to the
+        end of its body, which is just such a copy of the implicit return.  Left
+        naming a deleted address the reader resolves it onto the first instruction
+        past that address -- the out-of-line handler behind it -- and the body
+        reads as an empty clause followed by straight-line code.
+        """
+        jump_ops = set(dis.hasjabs) | set(dis.hasjrel)
+        for raw in self.raw:
+            if raw.opcode not in jump_ops or not isinstance(raw.argval, int):
+                continue
+            kept = self._epilogue_copies.get(raw.argval)
+            if kept is None or raw.offset in self._retarget:
+                continue
+            self._retarget[raw.offset] = kept
 
     def _handler_epilogues(self, by_offset, index):
         """Where each clause of the chain starting at *index* returns ``None``.
@@ -2276,6 +2366,20 @@ class Rewriter(object):
             return False
         return bool(raw.arg & (1 << self.attr_method_bit))
 
+    def _comprehension_run_end(self, resume):
+        """Index one past an inlined comprehension and its local restores.
+
+        :meth:`_lift_comprehension` replaces the whole run with one call, so the
+        bookkeeping that puts the borrowed locals back is dropped with it;
+        neither the pushes inside the run nor the slots it frees belong to the
+        stack the enclosing call is measured against.
+        """
+        raw_list = self.raw
+        while resume < len(raw_list) \
+                and raw_list[resume].offset in self._drops:
+            resume += 1
+        return resume
+
     def analyse(self):
         """Decide, per call, whether it is a plain, method or decorator call.
 
@@ -2304,8 +2408,18 @@ class Rewriter(object):
         pending_kw = None
         pending_depths = []
         just_made = False
+        lifted_until = -1
         for index, raw in enumerate(self.raw):
             opname = raw.opname
+            if index < lifted_until:
+                continue
+            spec = self.comprehensions.get(raw.offset)
+            if spec is not None:
+                # The whole inlined loop is replaced by one call, so neither the
+                # container it builds nor the local it borrows is ever stacked
+                # beside a waiting loader -- only the iterable in front of it is.
+                lifted_until = self._comprehension_run_end(spec[4])
+                continue
             if opname == 'KW_NAMES':
                 pending_kw = self.code.co_consts[raw.arg]
                 continue
@@ -2485,11 +2599,16 @@ class Rewriter(object):
         (the tail re-emission), not when it is reached in place.
         """
         raw = self.raw[index]
-        close_after = raw.offset in self.try_closes
         before = len(out)
         result = self._translate_instruction(
             index, out, runs, shape, close_merges, ignore_drops)
-        if close_after and len(out) > before:
+        # A statement translated as a group -- the ``a, b = b, a`` rotation is
+        # one -- is walked from its first instruction, so the close the table
+        # anchors on its *last* one would never be seen.  Every close inside the
+        # span is emitted, in the order the region ends them.
+        closes = [step for step in range(index, min(result, len(self.raw)))
+                  if self.raw[step].offset in self.try_closes]
+        if closes and len(out) > before:
             # 3.9 closed the block straight after the last instruction of the
             # protected region.  The inline ``else``/``finally`` clause 3.11
             # kept in front of the handler follows right after it, and the
@@ -2497,22 +2616,25 @@ class Rewriter(object):
             # The close is emitted here rather than inside the translation of
             # the instruction, because several opcodes are translated by a
             # branch of their own that never reaches the common tail.
-            close = self._make(raw, 'POP_BLOCK', None, None, line_no=None)
-            close.offset = self._close_offset(index)
-            close.is_jump_target = close.offset in self.jump_targets
-            out.append(close)
-            # A statement stacks several blocks on one instruction -- the
-            # ``finally`` of ``try``/``except``/``finally`` nests the
-            # ``except`` block -- and 3.9 popped each of them at the end of
-            # the body.  The table names that point once, so the extra pops
-            # are repeated here in the same nesting order.  Each needs an
-            # address of its own: a branch aimed at the close must reach the
-            # first pop only, and a shared address would make the second pop
-            # claim it instead.
-            for _ in range(self.close_extras.get(raw.offset, 0)):
-                extra = self._make(raw, 'POP_BLOCK', None, None, line_no=None)
-                extra.offset = self._fresh_offset(close.offset)
-                out.append(extra)
+            for step in closes:
+                anchor = self.raw[step]
+                close = self._make(anchor, 'POP_BLOCK', None, None, line_no=None)
+                close.offset = self._close_offset(step)
+                close.is_jump_target = close.offset in self.jump_targets
+                out.append(close)
+                # A statement stacks several blocks on one instruction -- the
+                # ``finally`` of ``try``/``except``/``finally`` nests the
+                # ``except`` block -- and 3.9 popped each of them at the end of
+                # the body.  The table names that point once, so the extra pops
+                # are repeated here in the same nesting order.  Each needs an
+                # address of its own: a branch aimed at the close must reach the
+                # first pop only, and a shared address would make the second pop
+                # claim it instead.
+                for _ in range(self.close_extras.get(anchor.offset, 0)):
+                    extra = self._make(anchor, 'POP_BLOCK', None, None,
+                                       line_no=None)
+                    extra.offset = self._fresh_offset(close.offset)
+                    out.append(extra)
         return result
 
     def _fresh_offset(self, start):

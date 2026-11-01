@@ -157,6 +157,41 @@ All notable changes to this project are recorded here. The format follows
   read a run of stores after a `COPY 1` as a parallel assignment.
 * **`s[::-1]` printed as `s[None::-1]`** -- an omitted slice bound reached the
   decompiler as `LOAD_CONST None`.
+* **`tests/selftest_310plus.py` never ran** -- it called `os.chdir` with the
+  author's absolute path, and then `-m tests.selftest` inside the embedded
+  interpreters, which do not put the working directory on `sys.path`, so every
+  version raised `ModuleNotFoundError: No module named 'tests'`. The launcher
+  captured stdout only, so the cause was discarded and each version printed
+  `FAILED (exit 1)` while `python -m tests.selftest --all` stayed green. It now
+  derives the repository root from `__file__`, runs `tests/selftest.py` by
+  script path, prints the child's stderr on failure and takes the versions to
+  run as arguments: 3.10-3.14 report 2/2 and 3.15 3/3.
+* **A branch aimed at a re-emitted tail resolved onto the handler in front of it**
+  -- the reader took the first instruction at or after the jump's address, but the
+  tail a merge point re-emits is laid out behind the handler that was compiled in
+  front of it, so an instruction that merely follows the address can be listed
+  before the one carrying it. A run that holds the address exactly is now preferred
+  and the higher one is only the fallback -- this is what truncated `main` in the
+  3.12 `prime` sample.
+* **The duplicated `return None` epilogues of 3.11+ left their branches dangling**
+  -- folding the copies a handler region repeats deleted them in place, so a branch
+  that skipped to one named an address no instruction carries. Each deleted address
+  is now recorded with the copy that stays and the branches aimed at it are
+  re-aimed, which is how 3.9 wrote it: one epilogue that both the body and the
+  clauses reach.
+* **A method call whose argument is an inlined comprehension lost its receiver on
+  3.12+** -- `"".join([c for c in x])` decompiled to `([c for c in x])`. The call
+  classification measured the stack against the raw inlined loop, which
+  `_lift_comprehension` later replaces with a single call, so the pending loader
+  never recognised its own `CALL`. The whole run and the bookkeeping that returns
+  the borrowed locals are skipped now.
+* **A function's explicit trailing `return None` could not survive the epilogue
+  folding on 3.11** -- a `JUMP_FORWARD` into the epilogue is the only trace a
+  source-level `return` leaves, and an AST-level rule that dropped every trailing
+  bare `return` erased it along with the genuine ones. The reader now decides at
+  the instruction stream: the pair counts as the implicit epilogue when the walk
+  reaches it at the end of the body, whether or not handler code is still listed
+  behind it. ROUND-TRIP 262/263 → **263/263**.
 
 ### Added
 
@@ -181,3 +216,36 @@ All notable changes to this project are recorded here. The format follows
   status; a traceback is reserved for actual bugs.
 * The root directory was tidied: the one-off `_d1_*.py` / `_debug_*.py` scripts
   moved into `debug/archive/`.
+* The repository itself was tidied, with no change to any decompiler's
+  behaviour (the gate still reports 234/263 round-trips and 77/77 control
+  flows). `.gitignore` declared `embed_python/`, `debug/`, `_scratch/`,
+  `__pycache__/` and the local tooling directories ignored, but 9,815 of their
+  files were still tracked; they are out of the index now, so the tree tracks
+  112 files instead of 9,961 and `embed_python/` is genuinely the
+  download-on-demand directory the README describes. `_scratch/` is ignored in
+  full, not just its text output.
+* `README.md` described the removed `bytecode2code/` + `pyvers/` front ends and
+  claimed 3.13 and 3.14 produced only a normalised disassembly. It now matches
+  the seven `pyNNDecompiler/` back ends, records that `skeleton`, `ir` and
+  `code-info` are aliases of `decompile`, and documents how to run the gate
+  under the embedded interpreters.
+
+### Removed
+
+* The superseded back ends `FixedDecompiler39/` and `py311_x` moved to `old/`,
+  where the archived `pyvers/` already lived; no live module imported them.
+* The scripts that overwrote a whole backend with one file (`apply_fix3.py`,
+  `apply_fixed39.py`, `fix2.py`, `fix_fixed.py`, `propagate_*.py`) -- the
+  per-version copies have diverged too much for that since, and the rule is now
+  to port reader fixes by anchor.
+* `independent_control_flow/` in its entirety. `py310Decompiler` through
+  `py315Decompiler` each carried a byte-identical copy of a placeholder engine
+  that nothing imported; the 3.9 copy was on the live path but was a no-op --
+  its `rebuild_try_finally_raise()` dropped statements only when their *text*
+  equalled one of three literals copied from a single probe, and it is handed
+  `ast.stmt` nodes, so the comparison never matched. Removing the call left the
+  gate unchanged (234/263 round-trips, 77/77 control flows).
+* Unreferenced scratch files from the root: `tmp.txt`, `awkprof.out`. The
+  reproduction inputs moved to `tests/repro/`; `boom.py` and `test_sc.py` stay
+  at the root because `bugs.md` refers to them by path.
+

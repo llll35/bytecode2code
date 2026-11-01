@@ -27,6 +27,7 @@ syntactic; the decompiler keeps doing all the work.
 import dis
 import sys
 import ast
+from bisect import bisect_right
 from .disassembler import Instruction
 from .decompiler import _is_bare_return
 
@@ -432,6 +433,9 @@ class Rewriter(object):
                     self.jump_targets.add(int(raw.argval))
         self._drops = set()
         self._retarget = {}
+        #: Where a copy of the implicit return was dropped, and the address of
+        #: the copy that stays -- a branch aimed at the former needs the latter.
+        self._epilogue_copies = {}
         self._handler_heads = set()
         #: 3.14 opens a ``with`` block with ``COPY``/``LOAD_SPECIAL`` instead of
         #: ``BEFORE_WITH``; the anchor offset maps to the instructions that make
@@ -453,6 +457,7 @@ class Rewriter(object):
         self._mark_dead_handlers()
         self._redirect_handler_exits()
         self._analyse_exception_loop_exits()
+        self._retarget_dropped_epilogues()
 
     def _normalise_raw(self, raw_list):
         """Fold 3.13/3.14-only encodings onto the 3.9 vocabulary.
@@ -480,6 +485,25 @@ class Rewriter(object):
             expanded.append(raw)
         if self.version >= (3, 13):
             expanded = self._fold_function_attributes(expanded)
+            # 3.13 dropped ``LOAD_CLOSURE``: a closure tuple is built from plain
+            # loads of the enclosing frame's cell variables.  The reader still
+            # tells a captured variable from a value by the opcode, so the load
+            # of a name this frame hands to a nested function goes back.
+            cellvars = set(self.code.co_cellvars)
+            for index, raw in enumerate(expanded):
+                if raw.opname != 'MAKE_FUNCTION' or not (raw.arg or 0) & 8:
+                    continue
+                tuple_index = index - 2
+                if tuple_index < 0 or expanded[tuple_index].opname != 'BUILD_TUPLE':
+                    continue
+                count = expanded[tuple_index].arg or 0
+                first = tuple_index - count
+                if first < 0:
+                    continue
+                for position in range(first, tuple_index):
+                    operand = expanded[position]
+                    if operand.opname == 'LOAD_FAST' and operand.argval in cellvars:
+                        expanded[position] = operand._replace(opname='LOAD_CLOSURE')
         return expanded
 
     @staticmethod
@@ -1702,11 +1726,15 @@ class Rewriter(object):
         A region can also start *past* the nested block it protects, because an
         exit that already ran the inlined ``finally`` is left out of the table:
         ``try: ... except: ... finally: ...`` protects the clause chain but not
-        the ``return`` that ran the clause.  Any handler dispatch that lies
-        inside the region therefore pulls the start back to its own body, which
-        is where 3.9 pushed that block -- and ours, in front of it.
+        the ``return`` that ran the clause.  That chain is a region of its own
+        and the walk steps back to its body -- where 3.9 pushed that block, and
+        ours in front of it.  Only a chain at our own unwinding depth qualifies:
+        a dispatch we reach across a shallower or deeper region belongs to an
+        earlier, disjoint statement whose body lies behind us, and anchoring at
+        it opens our block around a whole other statement.
         """
         heads = self._table_heads(entries)
+        depth = self._region_depth(entries, start, target)
         begins = start
         while True:
             for entry in entries:
@@ -1714,11 +1742,25 @@ class Rewriter(object):
                     continue
                 if not begins <= entry.target < target:
                     continue
-                if entry.end == begins or entry.target in heads:
+                if entry.end == begins or (entry.target in heads
+                                           and (depth is None
+                                                or entry.depth == depth)):
                     begins = entry.start
                     break
             else:
                 return begins
+
+    def _region_depth(self, entries, start, target):
+        """The unwinding depth the table gives the region we are anchoring.
+
+        ``depth`` counts the handlers already in force, so two regions at the
+        same depth are successive spans of one statement's blocks, and a span at
+        another depth belongs to a block nested inside it or enclosing it.
+        """
+        for entry in entries:
+            if entry.start == start and entry.target == target:
+                return entry.depth
+        return None
 
     def _table_heads(self, entries):
         """Offsets the table dispatches through -- one per ``try`` statement.
@@ -2235,9 +2277,53 @@ class Rewriter(object):
         step = self._return_none_at(index)
         if step is None:
             return
-        self._drops.add(self.raw[step].offset)
+        copied = [self.raw[step].offset]
         if self.raw[step].opname == 'LOAD_CONST':
-            self._drops.add(self.raw[step + 1].offset)
+            copied.append(self.raw[step + 1].offset)
+        self._drops.update(copied)
+        kept = self._kept_copy_before(step)
+        if kept is not None:
+            for offset in copied:
+                self._epilogue_copies[offset] = kept
+
+    def _kept_copy_before(self, step):
+        """Address of the surviving implicit return that the copy at *step* duplicates.
+
+        3.11 lays those copies back to back -- one per protected region, one per
+        clause -- and the scope keeps a single one of them, so the whole run
+        reads as the same two instructions repeated.  The nearest whole copy in
+        front of the one being dropped is therefore the one that stays; where
+        none is left, this copy is the only one and its address is kept as it is.
+        """
+        raw_list = self.raw
+        for position in range(step - 1, -1, -1):
+            if self._return_none_at(position) != position:
+                continue
+            if raw_list[position].offset in self._drops:
+                continue
+            if raw_list[position].opname == 'LOAD_CONST' \
+                    and raw_list[position + 1].offset in self._drops:
+                continue
+            return raw_list[position].offset
+        return None
+
+    def _retarget_dropped_epilogues(self):
+        """Re-aim the branches that skipped to a copy this pass deleted.
+
+        A conditional jump guarding the last statement of a scope skips to the
+        end of its body, which is just such a copy of the implicit return.  Left
+        naming a deleted address the reader resolves it onto the first instruction
+        past that address -- the out-of-line handler behind it -- and the body
+        reads as an empty clause followed by straight-line code.
+        """
+        jump_ops = set(dis.hasjabs) | set(dis.hasjrel)
+        for raw in self.raw:
+            if raw.opcode not in jump_ops or not isinstance(raw.argval, int):
+                continue
+            kept = self._epilogue_copies.get(raw.argval)
+            if kept is None or raw.offset in self._retarget:
+                continue
+            self._retarget[raw.offset] = kept
 
     def _handler_epilogues(self, by_offset, index):
         """Where each clause of the chain starting at *index* returns ``None``.
@@ -2370,6 +2456,20 @@ class Rewriter(object):
             return False
         return bool(raw.arg & (1 << self.attr_method_bit))
 
+    def _comprehension_run_end(self, resume):
+        """Index one past an inlined comprehension and its local restores.
+
+        :meth:`_lift_comprehension` replaces the whole run with one call, so the
+        bookkeeping that puts the borrowed locals back is dropped with it;
+        neither the pushes inside the run nor the slots it frees belong to the
+        stack the enclosing call is measured against.
+        """
+        raw_list = self.raw
+        while resume < len(raw_list) \
+                and raw_list[resume].offset in self._drops:
+            resume += 1
+        return resume
+
     def analyse(self):
         """Decide, per call, whether it is a plain, method or decorator call.
 
@@ -2398,8 +2498,18 @@ class Rewriter(object):
         pending_kw = None
         pending_depths = []
         just_made = False
+        lifted_until = -1
         for index, raw in enumerate(self.raw):
             opname = raw.opname
+            if index < lifted_until:
+                continue
+            spec = self.comprehensions.get(raw.offset)
+            if spec is not None:
+                # The whole inlined loop is replaced by one call, so neither the
+                # container it builds nor the local it borrows is ever stacked
+                # beside a waiting loader -- only the iterable in front of it is.
+                lifted_until = self._comprehension_run_end(spec[4])
+                continue
             if opname == 'KW_NAMES':
                 pending_kw = self.code.co_consts[raw.arg]
                 continue
@@ -2526,7 +2636,51 @@ class Rewriter(object):
                     while k < len(positions) and positions[k] < nxt:
                         k += 1
             index = self._translate_step(index, out, runs, shape, close_merges)
+        self._retarget_stray_jumps(out)
         return out
+
+    def _retarget_stray_jumps(self, out):
+        """Move a jump aimed at an instruction a fold swallowed.
+
+        3.14 threads the falsy branch of a short circuit past the ``POP_TOP``
+        that :meth:`_or_pop_jump` folds into the jump itself, so the target
+        address names an instruction the 3.9 view no longer has.  That path
+        discards the value either way, so the branch belongs on the instruction
+        the pop used to precede; leaving it unresolvable makes the reader drop
+        the whole condition it guards.
+        """
+        live = sorted({ins.offset for ins in out})
+        if not live:
+            return
+        for ins in out:
+            if not (ins.opname.startswith("JUMP") or ins.opname.startswith("POP_JUMP")
+                    or ins.opname in ("FOR_ITER", "SETUP_FINALLY", "SETUP_EXCEPT")):
+                continue
+            target = ins.argval
+            if not isinstance(target, int) or target in live:
+                continue
+            position = bisect_right(live, target)
+            if position == len(live):
+                continue
+            landing = live[position]
+            # 3.14 also knows the discarded value is falsy, so it skips the test
+            # that value would have been fed to.  3.9 kept the test: the branch
+            # is the same ``and``/``or`` chain with one hop more.  Hand the
+            # branch back to the boolean jump it fell out of, or the reader sees
+            # the chain's tail as a condition of its own.
+            at = next(k for k, other in enumerate(out) if other.offset == landing)
+            if at:
+                fallthrough = out[at - 1]
+                if (fallthrough.opname.endswith("_OR_POP")
+                        and isinstance(fallthrough.argval, int)
+                        and fallthrough.argval > landing):
+                    landing = fallthrough.offset
+            ins.argval = landing
+            ins.argrepr = _repr_of(ins.opname, ins.arg, landing)
+            for other in out:
+                if other.offset == landing:
+                    other.is_jump_target = True
+                    break
 
     def _close_merge_offsets(self):
         """Map each protected-region close offset to the point past its handler.

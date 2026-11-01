@@ -118,12 +118,27 @@ class Decompiler310(_BaseDecompiler):
         return plus whatever the handler of a ``with`` or ``finally`` the body
         opened left behind, all of which :meth:`_recover_else_clause` would
         otherwise read as the clause.
+
+        The copied return is specifically ``LOAD_CONST None``; a gap that opens
+        with anything else is a clause the programmer wrote -- 3.10 emits
+        ``else: return x`` inline after the body's ``POP_BLOCK``, and folding
+        that load into the body instead reads it as a ``return`` the body never
+        had.
         """
         if not self._copied_none_return:
             return super()._recover_else_clause(
                 code, instructions, try_end_idx, handler_start_idx, post
             )
-        return []
+        first = next((k for k in range(try_end_idx + 1, handler_start_idx)
+                      if instructions[k].opname not in self._BLOCK_NOISE), None)
+        if first is None or (
+            instructions[first].opname == "LOAD_CONST"
+            and instructions[first].argval is None
+        ):
+            return []
+        return super()._recover_else_clause(
+            code, instructions, try_end_idx, handler_start_idx, post
+        )
 
     def _with_exit_terminator(
         self, instructions, pop_idx: int, limit: int, body_value: bool = False

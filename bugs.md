@@ -1,8 +1,77 @@
 # 项目缺陷清单（bugs.md）
 
-> 最后更新：2026-10-30。状态含义：
+> 最后更新：2026-11-01。状态含义：
 > **已修复** / **部分修复** / **未修复** / **不适用**。
 > 复现与验证命令见文末。
+
+---
+
+## 2026-11-01 门禁状态快照
+
+| 命令 | 结果 |
+|------|------|
+| `embed_python/python-3.12/python.exe tests/run.py` 的 ROUND-TRIP | **263/263** |
+| `tests/run.py` 的 CONTROL FLOW | **77/77**（七版本各 11/11） |
+| `python main.py selftest` | **2/2** 通过 |
+| `embed_python/python-3.12/python.exe tests/test_cfg.py` | 8 项失败，与 HEAD 逐字一致（既有，非本轮回退） |
+
+ROUND-TRIP 全部逐字节一致。自 2026-10-30 的 234/263 起，本轮修复见下节 H/I/J。
+
+---
+
+## 2026-11-01 修复摘要
+
+| 命令 | 修复前 | 修复后 |
+|------|--------|--------|
+| ROUND-TRIP | 262/263 | **263/263** |
+| 3.11 组 | 48/48 | 48/48（H/I 移植后曾回退到 46/48，J 项的 reader 侧改法把它取回来） |
+| 3.12 组 | 48/49 | **49/49** |
+
+| # | 缺陷 | 影响版本 | 根因 / 修法 |
+|---|------|----------|-------------|
+| H | 跳转按偏移解析时命中「后面重排的那段尾巴」，`main` 截断 | 七版本 | `_find_target_idx` 原先取第一条 `offset >= target` 的指令。尾巴（`_save_tail_for_merge`）在合并点重排到 out-of-line handler **之后**，于是仅仅「排在这个地址后面」的指令会排在携带这个地址的指令前面。现在先找**精确**等于该地址的一条，找不到才退回到第一条更大的；七份 `decompiler.py` 同一条锚点移植 |
+| I | handler 尾部被复制的隐式 `return None` 删掉后，跳向它的分支落空 | 3.11–3.15 | `_redirect_handler_epilogues` 只删副本、不动指向它的跳转。现在 `_drop_return_none` 记下「删掉的地址 → 留下的那份地址」（`_kept_copy_before` 往前找最近一条整份存活、且自己后面仍跟着 `RETURN` 的 `return None`），`_retarget_dropped_epilogues` 再把瞄准被删地址的分支改瞄到留下的那份上 |
+| J | 内联推导式让外层方法调用退化成 `([c for c in x])` | 3.12–3.15 | 3.12 把列表推导就地展开成 `LOAD_FAST_AND_CLEAR`/`BUILD_LIST`/`FOR_ITER`/`END_FOR`，`_lift_comprehension` 之后把整段换成一次调用；但 `analyse()` 的 `pending_depths` 是按**原始**那段流水算的，容器入栈、借用的局部出栈全都算进待定 loader 的深度，于是 `"".join(...)` 的 `LOAD_METHOD` 对不上自己的 `CALL`，被发成 `CALL_FUNCTION`，reader 把接收者丢掉。现在 `analyse()` 用 `_comprehension_run_end` 整段跳过推导式及其收尾，只统计它前面那个可迭代对象 |
+
+### 关于「函数末尾显式 `return None`」的读法（J 的副产品）
+
+I 落地后，`_validate_input`（3.12）多出一条凭空 `return None`：删掉副本、把
+分支改瞄到**留在原地**的那份之后，这份尾巴排在 `try` 的 `POP_BLOCK` 与其
+out-of-line handler 之间，于是整条流水的末尾不再是它。原先按 AST 放宽
+`_drop_dead_tail` 可以压掉，但同一条规则会连 3.11 `probe_except_as` 里源码
+**真写了** `return None` 的四个函数一起压掉（往返 48/48 → 46/48）。
+
+现在的判据回到指令流：`_is_epilogue_pair` 除「这对 `LOAD_CONST None` /
+`RETURN_VALUE` 是流水最后两条」之外，还认「其后每一条指令都落在已被
+`_handled_ranges` 消费掉的 out-of-line 区间里」——3.9 只有一份尾声、谁都跳进
+它，3.11+ 复制的那份停在 handler 前面，尾巴后面只剩 reader 早已读完的 handler。
+`_tail_is_jump_reached` 仍在原地：一条 `JUMP_FORWARD`/`JUMP_ABSOLUTE` 瞄准它是
+源码级 `return` 留下的唯一痕迹，此时不能丢。
+
+### 仍未修复：`try` 体内的条件 `break` + `except` + `finally`
+
+门禁语料没有这一形状，七组全绿不等于它已修好。下面的片段在 3.11–3.15 仍然读错
+（3.14/3.15 造出 `except ValueError: break` 与假的 `else:`，3.12 把整个循环读成
+`try/except/else/finally`，3.11 输出重复的 `while True`）：
+
+```python
+def f(x):
+    while True:
+        try:
+            if x:
+                break
+        except ValueError:
+            pass
+        finally:
+            print(1)
+```
+
+`break` 在 `try` 体末尾被跳转线程成 NOP，`except` 链与 `finally` 又要 handler 排在
+循环出口之后——同族的无条件 `break`（`flow_break_in_try`）已由 G 项在七组跑通，条件
+`break` 走的是 `_analyse_exception_loop_exits` 的另一条分支。另外 3.11/3.12 与
+3.14/3.15 的 `_analyse_exception_loop_exits` 是**两套不同的算法**（2609 vs 2827
+字符，3.14/3.15 那套还带着 `has_normal_back_edge` 与 `getattr(self, '_loop_breaks',
+{})` 的旧写法），修之前得先把两边对齐，否则一条分支上的修法在另一边不生效。
 
 ---
 
@@ -192,6 +261,10 @@ ROUND-TRIP 232/263、CONTROL FLOW 56/77，仍因已有失败退出 1。
 * 额外模块探针仍暴露独立问题，未扩大到本次修复：模块 `except E as e` 的恢复、
   3.9 双层 if/else 的内层 else 丢失、3.11+ 空 try 的嵌套 finally 恢复、
   3.15 模块 if/with/else 把 else 语句重复读入 with。这些不代表全部模块形状已通过。
+
+**2026-11-01 复核**：上面前五条里的 `flow_*` 全部已过——G 项（10 处改动）加本轮 H/I/J
+之后 CONTROL FLOW **77/77**、ROUND-TRIP **263/263**。`independent_control_flow/` 已删除
+（见缺陷21）。重复的「2026-10-27 修复摘要」两节仍未合并。
 
 ---
 
@@ -531,8 +604,6 @@ body 范围里，reader 以为这个 `try` 没有返回值。
 以下失败是**编译期信息丢失 / 两种源码编译成同一字节码**，反编译无从区分，
 强行「修复」会破坏其它用例，故保留为已知限制：
 
-- **`except_as` / `exceptions`**：函数末尾显式 `return None` 与隐式尾声字节码相同。
-  反编译选择省略（发射会污染所有无显式 return 的函数）。
 - **`whileelse`**：`while ... else` 无 `break` 时，`else` 体与循环后代码字节码相同。
 - **`retfinally` 的 `c`（3.10/3.11/3.12）**：`return y` 位于恒返回的 try 体之后，
   是死代码，3.10+ 编译期已优化删除。
@@ -574,9 +645,11 @@ def first():
 
 ### 缺陷5：架构分离不清晰
 **严重程度**：中
-**状态**：**已改善**。`pyvers` 现在是可导入的包（相对导入、统一模块身份），
-版本差异集中在 `decomp_compat.py`（3.10）与 `decomp311.py`（3.11/3.12），
-错误类型统一到 `bytecode2code/errors.py`。
+**状态**：**已改善**。原条目说的 `pyvers` / `bytecode2code` 包已在重构中移入
+`old/`；现在是七个自包含的 `pyNNDecompiler/` 目录，互不 import，版本差异集中在
+各自的 `decomp_compat.py`（3.10）与 `decomp311.py`（3.11+），异常表回到 3.9 形状
+后才进 reader。代价是 `decompiler.py` 有七份副本，改动必须**按锚点**移植。
+错误类型每份后端各有 `errors.py`。
 
 ### 缺陷6：测试覆盖不足
 **严重程度**：中
@@ -592,6 +665,16 @@ def first():
 **严重程度**：低
 **状态**：**已修复**。根目录 35 个一次性脚本已移入 `debug/archive/`，
 并新增 `.gitignore`。
+**2026-10-30 补修**：`.gitignore` 声明忽略的 `embed_python/`、`debug/`、
+`_scratch/`、`__pycache__/`、`.workbuddy-ai/` 仍有 **9815** 个文件被 git 跟踪，
+门禁声明的「按需下载」与实际布局相反。现全部移出索引（磁盘文件未删），
+跟踪文件从 9961 降到 112；`_scratch/` 改为整目录忽略。根目录另存的一次性脚本
+（`apply_fix3.py`、`apply_fixed39.py`、`fix2.py`、`fix_fixed.py`、
+`propagate_*.py`，都是「拿一份文件覆盖七个后端」的工具，与按锚点移植的规则冲突）
+和 `tmp.txt`、`awkprof.out` 已删除；`1.py`、`crash_test.py`、
+`decompile_test_sc.py`、`recursion_bomb_gen.py` 移入 `tests/repro/`；
+`FixedDecompiler39/`、`py311_x` 移入 `old/`。`boom.py`、`test_sc.py` 留在根目录
+（本文件按路径引用）。
 
 ### 缺陷9：魔法数字和硬编码引用
 **严重程度**：低
@@ -604,21 +687,24 @@ def first():
 
 ### 缺陷11：缺少依赖管理文件
 **严重程度**：中
-**状态**：**已修复**。新增 `pyproject.toml`（无第三方依赖；`bytecode2code`
-可安装，`pyvers` 依赖仓库布局故不打包）。
+**状态**：**未修复**。曾记为「已修复（新增 `pyproject.toml`）」，但仓库里没有
+这个文件——见缺陷22。项目本身无第三方依赖，缺的是打包元数据与 console script。
 
 ### 缺陷12：缺少 CI/CD 配置
 **严重程度**：中
-**状态**：**已修复**。新增 `.github/workflows/ci.yml`（round-trip + 跨版本自检）。
+**状态**：**未修复**。曾记为「已修复（新增 `.github/workflows/ci.yml`）」，
+仓库里没有该目录——见缺陷22。门禁目前只能手动跑 `tests/run.py`。
 
 ### 缺陷13：测试运行不统一
 **严重程度**：低
-**状态**：**已修复**。`python -m tests.run` 与 `python main.py selftest`
-两条命令；`python -m bytecode2code` 亦可用。
+**状态**：**已修复**。`python main.py selftest` 与 `embed_python/python-X.Y/python.exe
+tests/run.py` 两条命令。`python -m tests.run` 只在宿主 `python` 能读该 payload 时可用，
+嵌入式发行版不把工作目录放进 `sys.path`，在它们里面会抛
+`ModuleNotFoundError: No module named 'tests'`；`python -m bytecode2code` 随包一起没了。
 **2026-10-20 补修**：`tests.run` 原先假设语料只有一个版本，混入 3.12 的
 `prime.pyc` 后必然在另一版本的样本上抛 `bad marshal data`（两条命令实际上都
 跑不起来）。现改为按版本分组、每组用匹配的解释器执行，并用版本感知的反编译器
-（`pyvers.decomp_compat.make_decompiler`）而非固定的 3.9 reader 处理样本。
+（各后端的 `make_decompiler`）而非固定的 3.9 reader 处理样本。
 
 ### 缺陷14：缺少 CHANGELOG
 **严重程度**：低
@@ -626,8 +712,10 @@ def first():
 
 ### 缺陷15：异常处理不一致
 **严重程度**：中
-**状态**：**已修复**。新增 `bytecode2code/errors.py` 异常层级；CLI 把包内错误
-转成一行消息 + 非零退出码，traceback 只留给真正的 bug。
+**状态**：**已修复**。每份 `pyNNDecompiler/errors.py` 提供同一套异常层级
+（`Bytecode2CodeError` → `PYCError` / `UnsupportedBytecodeError` /
+`DecompilationError`）；CLI 把包内错误转成一行消息 + 非零退出码，
+traceback 只留给真正的 bug。
 
 ### 缺陷16：缺少性能基准测试
 **严重程度**：低
@@ -635,7 +723,8 @@ def first():
 
 ### 缺陷17：缺少发布流程
 **严重程度**：中
-**状态**：**已改善**。`pyproject.toml` 提供打包元数据与 console script。
+**状态**：**未修复**。曾记为「已改善（`pyproject.toml` 提供打包元数据与
+console script）」，仓库里没有这个文件——见缺陷22。
 
 ### 缺陷18：嵌入 Python 版本增加复杂性
 **严重程度**：低
@@ -647,13 +736,60 @@ def first():
 
 ### 缺陷20：硬编码的版本检查
 **严重程度**：低
-**状态**：**已改善**。magic 表集中在 `bytecode2code/pyc_parser.py` 与
-`pyvers/versions.py`，并有 `get_python_version()` 单一入口。
+**状态**：**已改善**。magic 表原以为集中在 `bytecode2code/pyc_parser.py` 与
+`pyvers/versions.py`；`py39Decompiler` … `py315Decompiler` 的
+`independent_control_flow/` 是同一批占位工具，2026-10-30 全部删除（见缺陷21）。
+现每份 `pyNNDecompiler/pyc_parser.py` 各自持表，`main.py` 按 header 选后端。
+
+### 缺陷21：3.9 的后处理用硬编码源码字符串去重
+**严重程度**：中
+**状态**：**已修复（删除）**。`py39Decompiler/decompiler.py` 原先在
+`_emit_statements` 之后调用
+`independent_control_flow/full_engine.ControlFlowEngine.rebuild_try_finally_raise()`，
+该函数把相邻重复、且**字面量等于** `"raise"`、
+`"raise RuntimeError('hit 3')"`、`"print('inner finally always run')"`
+的语句删掉——这三条文本抄自 `tests/cases.py:495` 的那条探针，不是控制流规则。
+同一个类的 `reconstruct_exception_table()` 直接返回三个空列表，
+`apply_none_filter()` / `clean_unbound_del_e()` 是对输出字符串做 `replace`。
+
+实际它是**恒等函数**：`_emit_statements` 返回 `List[ast.stmt]`，
+`isinstance(s, str)` 对每个元素都是 `False`，`line` 恒为 `""`，
+而 `""` 不在那三条字面量里，所以一句都删不掉。已连同调用、import 和整个
+`py39Decompiler/independent_control_flow/`（3.10+ 的六份副本本轮早先已删）
+一起移除，`_emit_statements` 之后直接进 `_drop_dead_tail`。
+删除后七组门禁逐项复核，与删除前一致（ROUND-TRIP 234/263、CONTROL FLOW 77/77，
+`test_sc.pyc` 在 3.9/3.10 的 AST 仍与原源码一致）。
+
+真正需要的那条规则早就在 reader 里：出口内联副本 + 再抛由
+`_collect_finally_body` / `_hide_escape_copies` 按形状识别，见 B、G 两项。
+
+### 缺陷22：文档描述不存在的产物
+**严重程度**：中
+**状态**：**部分修复**。仓库里从来没有 `pyproject.toml`、`.github/workflows/ci.yml`
+或 `.kiro/specs/`（`git log` 无记录），本文件缺陷11/12/17 的「已修复」与
+`CHANGELOG.md` 的 `### Added` 段都把它们算成了交付物；缺陷5/6/7/11/13/15/18/20
+引用的 `pyvers/`、`bytecode2code/` 包也已在重构中移入 `old/`。
+2026-10-30 重写 `README.md`：按七份 `pyNNDecompiler/` 后端描述布局，
+删除双前端（`bytecode2code` + `pyvers`）与「3.13/3.14 只出规格化反汇编」的
+过期结论，说明 `skeleton`/`ir`/`code-info` 现在只是 `decompile` 的别名，
+并补上嵌入式解释器跑门禁的方式。历史条目保留原文，本项负责记下差异。
+
+### 缺陷23：引导脚本硬编码绝对路径且一直跑不起来
+**严重程度**：低
+**状态**：**已修复**。`tests/selftest_310plus.py` 原先写死
+`os.chdir(r"D:\py\bytecode2code")`，换成别的目录就找不到 `embed_python/`；
+更要命的是它在嵌入式解释器里跑 `-m tests.selftest`，而嵌入式发行版不把
+工作目录放进 `sys.path`，必然 `ModuleNotFoundError: No module named 'tests'`，
+偏偏 `capture_output` 之后只打印 stdout，stderr 被丢掉，于是每个版本都显示
+`FAILED (exit 1)` 而看不出原因（`python -m tests.selftest --all` 一直是 15/15 绿的）。
+现在根目录由 `__file__` 推出，子进程按**脚本路径**调用 `tests/selftest.py`
+（它自己会把仓库根放进 `sys.path`），失败时打印 stderr，版本号可以作参数传。
+2026-10-30 复验：3.10–3.14 各 2/2、3.15 3/3 通过。
 
 ## 验证命令
 
 ```
-embed_python/python-3.12/python.exe tests/run.py   # ROUND-TRIP 234/263、CONTROL FLOW 77/77
+embed_python/python-3.12/python.exe tests/run.py   # ROUND-TRIP 263/263、CONTROL FLOW 77/77
 embed_python/python-3.14/python.exe tests/run.py   # 同一命令，任一版本作宿主都会扇出全部七组
 # 单版本组（换掉三处版本号即可）：
 BYTECODE2CODE_TESTS_GROUP=3.14 BYTECODE2CODE_TESTS_OUT=_scratch/g314.json \
@@ -663,6 +799,8 @@ embed_python/python-3.11/python.exe tests/test_cfg.py Rewriter311Tests  # 3 项�
 # 七版本分别执行下面的输出回归（将 3.10 替换为对应版本）：
 embed_python/python-3.10/python.exe tests/test_cfg.py OutputNormalizationTests  # 各 6 项通过
 embed_python/python-3.10/python.exe main.py decompile test_sc.pyc  # AST 与原源码一致，往返等价
+                                    # 前提是 test_sc.pyc 由 3.10 编译：`python main.py compile test_sc.py --version 3.10`
+embed_python/python-3.9/python.exe tests/selftest_310plus.py       # 逐版本 selftest（缺陷23 修好后，3.10–3.14 各 2/2、3.15 3/3）
 python main.py selftest             # 本次 host 3.9：2/2 通过
 python -B _scratch/probe_controlflow.py 3.9 3.10 3.11 3.12
 python -B _scratch/probe_probes_multiver.py 3.12   # 探针语料单版本往返（换 3.9/3.10/3.11）
@@ -677,5 +815,6 @@ python -B _scratch/probe_star_match.py      # except* 与 match
 解释器重新编译结果。源码形态的探针在**每个**版本都跑一遍——它们是唯一能分别
 压到 3.9/3.10/3.11/3.12 四条后端路径的语料。
 
-`_scratch/` 下的脚本是临时探针（`.gitignore` 只排除 `_scratch/pyc/`），
+`_scratch/` 下的脚本是临时探针（`.gitignore` 现已整目录忽略，2026-10-30 前只排除
+`pyc/` 和文本输出，另有 65 份被跟踪，已移出索引），
 `probe_probes_multiver.py` 直接对 `tests/cases.py` 的 `PROBES` 做单版本往返。

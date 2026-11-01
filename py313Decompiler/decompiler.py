@@ -4,7 +4,7 @@ import ast
 import sys
 from contextlib import contextmanager
 from typing import List, Dict, Any, Set, Tuple, Optional
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 
 from .cfg_flow import (
     ExceptionAnalyzer, KIND_AS_CLEANUP, KIND_EXCEPT, KIND_FINALLY, KIND_WITH,
@@ -420,9 +420,11 @@ class Decompiler:
         that came from :meth:`_decompile_code_object` and is already repaired
         simply stays that way.
         """
-        return self._emit_statements(code,
-                                     self._insert_dead_block_closes(instructions),
-                                     **kwargs)
+        return self._emit_statements(
+            code,
+            self._hoist_stray_block_tails(
+                self._insert_dead_block_closes(instructions)),
+            **kwargs)
 
     def _indent(self, level: int) -> str:
         return "    " * level
@@ -647,6 +649,52 @@ class Decompiler:
         if end == 0:
             return stmts
         return stmts[:end]
+
+    def _tail_is_jump_reached(
+        self, instructions: List[Instruction], tail_idx: int
+    ) -> bool:
+        """True when only an unconditional forward jump arrives at *tail_idx*.
+
+        The compiler writes a function's implicit ``return None`` at the spot the
+        body ends, so the tail is normally indistinguishable from an explicit
+        statement -- until an out-of-line construct, such as the ``as e``
+        cleanup of an ``except`` clause, is inserted between the last statement
+        and that epilogue.  Then reaching it needs a ``JUMP_FORWARD``, which is
+        the only trace the source-level ``return`` leaves: dropping the tail
+        would compile the jump away and re-lay-out the function.
+        """
+        if tail_idx >= len(instructions):
+            return False
+        target = instructions[tail_idx].offset
+        for ins in instructions[:tail_idx]:
+            if ins.opname not in ("JUMP_ABSOLUTE", "JUMP_FORWARD"):
+                continue
+            if ins.offset < target and _jump_target(ins) == target:
+                return True
+        return False
+
+    def _is_epilogue_pair(
+        self, instructions: List[Instruction], idx: int, total: int
+    ) -> bool:
+        """True when *idx* begins the ``return None`` the compiler wrote itself.
+
+        3.9 kept a single epilogue and let every path reach it, so the pair is
+        the last thing the code object holds.  A back-translated 3.11+ stream
+        duplicates it and parks a copy in front of the out-of-line handler, so
+        the body can well end on the pair with handler code still listed behind
+        it -- code the walk has already consumed, which makes the copy the end
+        of the body rather than another statement of it.
+        """
+        if instructions[idx].opname != "LOAD_CONST" \
+                or instructions[idx].argval is not None:
+            return False
+        if idx + 1 >= total or instructions[idx + 1].opname != "RETURN_VALUE":
+            return False
+        if idx + 1 == total - 1:
+            return True
+        ranges = self._handled_ranges
+        return all(any(start <= j < end for start, end in ranges)
+                   for j in range(idx + 2, total))
 
     def _is_bare_finally(self, instructions: List[Instruction], handler_start_idx: int) -> bool:
         """True when *handler_start_idx* begins a ``try``/``finally`` handler.
@@ -1895,8 +1943,8 @@ class Decompiler:
         # function on the same instance silently deletes its ``import``
         # statements and inherits the enclosing loop's jump offsets.
         with self._isolated_state():
-            instructions = self._insert_dead_block_closes(
-                self.dis.disassemble(code))
+            instructions = self._hoist_stray_block_tails(
+                self._insert_dead_block_closes(self.dis.disassemble(code)))
             if not instructions:
                 return self._indent(indent_level) + "pass"
             stmts = self._emit_statements(code, instructions, is_module=is_module)
@@ -2037,10 +2085,10 @@ class Decompiler:
                 i += ifexp_consumed
                 continue
             # Implicit `return None` tail of a function body.
-            if i + 1 == total - 1 and instr.opname == "LOAD_CONST" and instr.argval is None:
-                next_instr = instructions[i + 1] if i + 1 < total else None
-                if next_instr and next_instr.opname == "RETURN_VALUE":
-                    break
+            if self._is_epilogue_pair(instructions, i, total) \
+                    and (is_module
+                         or not self._tail_is_jump_reached(instructions, i)):
+                break
             consumed = self._process_instruction(
                 instr, instructions, i, code, stack, stmts,
                 is_module=is_module, limit=n,
@@ -2180,7 +2228,15 @@ class Decompiler:
         )
         return end - idx
 
-    _CLASS_ARTIFACT_NAMES = ("__module__", "__qualname__", "__classcell__")
+    _CLASS_ARTIFACT_NAMES = (
+        "__module__", "__qualname__", "__classcell__",
+        # 3.13 records where the class starts and which attributes its methods
+        # read, as plain stores inside the body.  Re-emitting them makes the
+        # compiler add its own copy on top, so the body ends up storing the
+        # line number twice -- once as the recovered constant, once as the
+        # ``<class-firstlineno>`` marker it always appends.
+        "__firstlineno__", "__static_attributes__",
+    )
 
     def _strip_class_artifacts(self, stmts: List[ast.stmt]) -> List[ast.stmt]:
         """Drop the bookkeeping assignments CPython injects into a class body.
@@ -3712,11 +3768,15 @@ class Decompiler:
         self._closure_names = None
         instrs = self.dis.disassemble(func_code)
         # Instruction ranges are indices into one code object, so the enclosing
-        # function's must not hide instructions of this one.
+        # function's must not hide instructions of this one.  An open ``try``
+        # left behind is worse still: the caller then reads every instruction
+        # after the definition as part of that block and drops the statements.
         old_handled = self._handled_ranges
+        old_exc_depth = len(self._exc_stack)
         self._handled_ranges = []
         body_stmts = self._emit_statements_safe(func_code, instrs)
         self._handled_ranges = old_handled
+        del self._exc_stack[old_exc_depth:]
         self._closure_names = old_closure
         body_stmts = self._drop_dead_tail(body_stmts)
         body_stmts = self._prepend_function_docstring(func_code, instrs, body_stmts)
@@ -6269,10 +6329,22 @@ class Decompiler:
         return i
 
     def _find_target_idx(self, instructions: List[Instruction], target_offset: int) -> int:
+        """Index a jump naming *target_offset* lands on.
+
+        Offsets rise with the list except where a tail re-emitted at its merge
+        point is laid out behind the handler that was compiled in front of it
+        -- and there an instruction that merely *follows* the address can be
+        listed before the one that carries it.  A run carrying the address
+        exactly is the one the branch was compiled against, so the scan keeps
+        going for it and only settles for the first higher address otherwise.
+        """
+        later = None
         for i, instr in enumerate(instructions):
-            if instr.offset >= target_offset:
+            if instr.offset == target_offset:
                 return i
-        return len(instructions)
+            if later is None and instr.offset > target_offset:
+                later = i
+        return len(instructions) if later is None else later
 
     #: Opcodes that end the normal flow into the instruction that follows them.
     _FLOW_TERMINATORS = frozenset((
@@ -6328,6 +6400,188 @@ class Decompiler:
             out.insert(entry, Instruction(
                 offset=handler.offset - 1, opcode=pop, opname="POP_BLOCK",
                 arg=None, argval=None, argrepr="", line_no=handler.line_no))
+        return out
+
+    def _hoist_stray_block_tails(self, instructions: List[Instruction]) -> List[Instruction]:
+        """Move code parked between a loop's back edge and its own handlers.
+
+        3.12 threads a ``break`` at the end of a ``try`` body into the code
+        behind the loop, and lays that code out *in front of* the out-of-line
+        handler instead of behind it::
+
+            SETUP_FINALLY   -> handler
+            ...body...
+            POP_BLOCK
+            JUMP_ABSOLUTE   -> the code below   # the break
+            results = []                     # code after the whole loop
+            handler:  DUP_TOP ...
+
+        The reader folds anything between a ``try``'s exit jump and its handler
+        into the ``else`` clause, so the rest of the function disappears into
+        the loop.  3.9 reaches the same tail with the same jump but places it
+        behind the last handler, so relocating it there restores the shape --
+        and the addresses are renumbered to match, because a jump is resolved by
+        the address it names and those have to rise with the new order.
+        """
+        out = list(instructions)
+        moved = False
+        while True:
+            stray = self._find_stray_block_tail(out)
+            if stray is None:
+                break
+            tail_start, handler_start, anchor = stray
+            block = out[tail_start:handler_start]
+            del out[tail_start:handler_start]
+            insert_at = anchor - (handler_start - tail_start) + 1
+            out[insert_at:insert_at] = block
+            out = self._renumber_stream(out)
+            moved = True
+        return out if moved else instructions
+
+    def _find_stray_block_tail(
+        self, instructions: List[Instruction]
+    ) -> Optional[Tuple[int, int, int]]:
+        """First run of code stranded inside the loop that jumps past it.
+
+        Returns ``(tail_start, handler_start, anchor)`` -- the run to move, where
+        the handlers it sits in front of begin, and the last instruction of the
+        handler chain that has to stay in front of it.
+        """
+        for back_edge, back in enumerate(instructions):
+            if back.opname not in ("JUMP_ABSOLUTE", "JUMP_FORWARD"):
+                continue
+            head = int(back.argval or 0)
+            if head >= back.offset:
+                continue  # forward transfer -- not the edge that closes a loop
+            head_idx = self._find_target_idx(instructions, head)
+            exits = self._block_handlers(instructions, head_idx, back_edge)
+            for index in range(head_idx, back_edge):
+                ins = instructions[index]
+                if ins.opname not in ("JUMP_ABSOLUTE", "JUMP_FORWARD"):
+                    continue
+                target = int(ins.argval or 0)
+                if target <= ins.offset:
+                    continue
+                if not index or instructions[index - 1].opname != "POP_BLOCK":
+                    # Only the jump that leaves a protected block parks its tail
+                    # behind the handler.  A branch jumping over its own clause
+                    # lands on code that stays where it is -- moving that would
+                    # split the block the handler belongs to.
+                    continue
+                start = self._find_target_idx(instructions, target)
+                if not index < start < back_edge:
+                    continue
+                stop = next((h for h in exits if start < h < back_edge), None)
+                if stop is None:
+                    continue
+                if self._runs_back_to_head(instructions, start, stop, head):
+                    # The run re-enters the loop, so it is part of the body --
+                    # an inlined ``finally`` at the merge point ends this way.
+                    continue
+                return start, stop, self._handler_chain_end(
+                    instructions, stop, back_edge, exits)
+        return None
+
+    def _handler_chain_end(
+        self,
+        instructions: List[Instruction],
+        handler_start: int,
+        back_edge: int,
+        exits: List[int],
+    ) -> int:
+        """Last instruction of the handler chain the loop's back edge belongs to.
+
+        3.9 ends a chain with the jump back to the loop, so the tail follows
+        that jump.  3.14 threads the clause's exit straight to the loop head and
+        leaves the ``RERAISE`` the match test falls through to *behind* it, and
+        dropping the tail there would split the chain in half.  A chain runs to
+        the point where the next one opens, as long as nothing outside it reaches
+        that stretch -- an instruction elsewhere branching into it means the
+        stretch is live code, and live code belongs to the moved tail's side.
+        """
+        next_chain = next((h for h in exits if h > back_edge), None)
+        if next_chain is None or next_chain - 1 == back_edge:
+            return back_edge
+        for source, ins in enumerate(instructions):
+            if handler_start <= source < back_edge:
+                continue
+            target = _jump_target(ins)
+            if not isinstance(target, int):
+                continue
+            if back_edge < self._find_target_idx(instructions, target) < next_chain:
+                return back_edge
+        return next_chain - 1
+
+    def _runs_back_to_head(
+        self, instructions: List[Instruction], start: int, end: int, head: int
+    ) -> bool:
+        """True when a jump inside ``[start, end)`` returns to the loop's head."""
+        for ins in instructions[start:end]:
+            if ins.opname not in ("JUMP_ABSOLUTE", "JUMP_FORWARD"):
+                continue
+            if int(ins.argval or 0) == head:
+                return True
+        return False
+
+    def _block_handlers(
+        self, instructions: List[Instruction], start: int, end: int
+    ) -> List[int]:
+        """Indexes where a block opened in ``[start, end)`` hands its failure over.
+
+        Those are the out-of-line handlers, and the code between a statement's
+        exit jump and the first of them is what 3.9 keeps behind the last one.
+        """
+        found = [
+            self._find_target_idx(instructions, int(ins.argval or 0))
+            for ins in instructions[start:end]
+            if ins.opname in ("SETUP_FINALLY", "SETUP_EXCEPT")
+        ]
+        return sorted(found)
+
+    def _renumber_stream(self, instructions: List[Instruction]) -> List[Instruction]:
+        """Re-address a reordered stream so the offsets rise with the list.
+
+        Moving instructions is only half a repair: a jump names an address, and
+        the instruction that reads it is the first one at or past that address,
+        so a run relocated behind handlers whose addresses are higher would
+        leave every jump aimed at it landing on a handler instead.  New addresses
+        go out per *distinct* old address, in order of first appearance, which
+        keeps the padding a ``SETUP_FINALLY`` shares with the statement it opens
+        -- merging the two would move the loop head off the setup.  The list is
+        copied, because the stream belongs to the disassembler and a second
+        reading of the same code object must not see a half-renumbered one.
+        """
+        fresh = {}
+        for ins in instructions:
+            if ins.offset not in fresh:
+                fresh[ins.offset] = 2 * len(fresh)
+        known = sorted(set(fresh))
+        relative = set(dis.hasjrel)
+        absolute = set(dis.hasjabs)
+
+        def resolve(offset: int) -> int:
+            if offset in fresh:
+                return fresh[offset]
+            # An address no instruction carries -- the padding in front of a
+            # handler -- keeps resolving to the instruction that follows it.
+            for old in known:
+                if old > offset:
+                    return fresh[old]
+            return offset
+
+        out = []
+        for ins in instructions:
+            moved = replace(ins)
+            moved.offset = fresh[ins.offset]
+            target = _jump_target(ins)
+            if isinstance(target, int):
+                aimed = resolve(target)
+                moved.argval = aimed
+                if ins.opcode in relative:
+                    moved.arg = aimed - moved.offset
+                elif ins.opcode in absolute:
+                    moved.arg = aimed
+            out.append(moved)
         return out
 
     def _exception_regions(self, instructions: List[Instruction]) -> Dict[int, Any]:

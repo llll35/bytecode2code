@@ -27,19 +27,18 @@ htmlcov/
 .idea/
 .vscode/
 *.swp
+*.orig
 .DS_Store
 Thumbs.db
 
 # --- Generated decompiler output ---
 debug/outputs/
 *.dis.txt
+tmp.txt
+junk.txt
 
-# --- Scratch probes (kept out of the tree on purpose) ---
-_scratch/pyc/
-_scratch/*.txt
-_scratch/*.out
-_scratch/*.err
-_scratch/*.pid
+# --- Scratch probes (throwaway debugging scripts, kept out of the tree) ---
+_scratch/
 
 # --- Vendored interpreters (download on demand; see README) ---
 embed_python/

@@ -1,25 +1,43 @@
-"""引导脚本：仅针对 Python 3.10+ 的新框架反编译器（py310~py314）运行 selftest。
+"""引导脚本：只对新框架（``pyXXDecompiler`` 文件夹）跑 3.10+ 的 selftest。
 
-完全依赖新框架（pyXXDecompiler 文件夹），不调用旧 `pyvers`、`bytecode2code`。
+等价于 ``python -m tests.selftest --all``，但逐版本单独输出，方便只看某一组。
+``tests/selftest.py`` 自己会把仓库根目录放进 ``sys.path``，所以这里按脚本路径
+调用它，而不是 ``-m tests.selftest`` -- 嵌入式发行版不把工作目录放进
+``sys.path``，用 ``-m`` 只会得到 ``ModuleNotFoundError: No module named 'tests'``。
 """
-import subprocess, sys, os
-os.chdir(r"D:\py\bytecode2code")
+import os
+import subprocess
+import sys
 
-def run(version: str):
-    interpreter = os.path.join("embed_python", "python-" + version, "python.exe")
+_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+os.chdir(_ROOT)
+
+SELFTEST = os.path.join(_ROOT, "tests", "selftest.py")
+
+
+def run(version: str) -> int:
+    interpreter = os.path.join(
+        _ROOT, "embed_python", "python-" + version, "python.exe")
     if not os.path.isfile(interpreter):
         print("SKIP %s (no interpreter)" % version)
-        return
-    cmd = [interpreter, "-m", "tests.selftest", "--all"]
+        return 0
     print("=" * 50)
-    print("RUNNING %s via %s" % (version, interpreter))
-    proc = subprocess.run(cmd, capture_output=True, text=True, encoding="utf-8", errors="replace")
-    # 输出中只保留本版本行
+    print("RUNNING %s via %s" % (version, os.path.relpath(interpreter, _ROOT)))
+    proc = subprocess.run([interpreter, SELFTEST],
+                          capture_output=True, text=True,
+                          encoding="utf-8", errors="replace")
     for line in proc.stdout.splitlines():
-        if line.startswith("== Python") or ("FAIL" in line) or ("ok" in line) or ("passed" in line):
-            print(line)
+        print(line)
     if proc.returncode != 0:
         print("FAILED (exit %d)" % proc.returncode)
+        print(proc.stderr)
+    return proc.returncode
 
-for v in ("3.10", "3.11", "3.12", "3.13", "3.14"):
-    run(v)
+
+def main() -> int:
+    versions = sys.argv[1:] or ("3.10", "3.11", "3.12", "3.13", "3.14", "3.15")
+    return max((run(version) for version in versions), default=0)
+
+
+if __name__ == "__main__":
+    sys.exit(main())
