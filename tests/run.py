@@ -65,12 +65,14 @@ def _interpreter_for(version: str):
 def _run_group(version: str) -> int:
     """Child entry point: round-trip *version*'s samples and the probes."""
     from tests import test_roundtrip
+    from tests.test_modern_control_flow import run as run_modern_flow
 
     names = [name for name, needed in _sample_versions().items()
              if needed == version]
     results = (test_roundtrip.run_file_samples(names)
                + test_roundtrip.run_probes()
-               + test_roundtrip.run_flow_probes())
+               + test_roundtrip.run_flow_probes()
+               + run_modern_flow())
     with open(os.environ[OUT_ENV], "w", encoding="utf-8") as handle:
         json.dump([result._asdict() for result in results], handle)
     return 0
@@ -92,9 +94,11 @@ def _collect(version: str, workdir: str, index: int):
     names = [name for name, needed in _sample_versions().items()
              if needed == version]
     if version == _running_version():
+        from tests.test_modern_control_flow import run as run_modern_flow
         return (test_roundtrip.run_file_samples(names)
                 + test_roundtrip.run_probes()
-                + test_roundtrip.run_flow_probes())
+                + test_roundtrip.run_flow_probes()
+                + run_modern_flow())
 
     interpreter = _interpreter_for(version)
     if interpreter is None:
@@ -148,7 +152,8 @@ def main() -> int:
         total = 0
         failed = 0
         for version, results in collected:
-            rows = [r for r in results if _is_flow(r) == include_flow]
+            rows = [r for r in results if _is_flow(r) == include_flow
+                    and not r.name.startswith('modern_')]
             if not rows:
                 continue
             print("\n-- Python %s --" % version)
@@ -176,6 +181,28 @@ def main() -> int:
     flow_ok, flow_total = _report(include_flow=True)
     print("\n%d/%d identical" % (flow_ok, flow_total))
     failed = (total - ok) + (flow_total - flow_ok)
+
+    print()
+    print("=" * 60)
+    print("COMBINED CONTROL FLOW  (3.11--3.13 structure, regions, behaviour)")
+    print("=" * 60)
+    from tests.control_flow_cases import INPUTS, SOURCES
+    print("%d scenarios, %d inputs each, compiled independently per target version"
+          % (len(SOURCES), len(INPUTS)))
+    modern_total = modern_ok = 0
+    for version, results in collected:
+        rows = [row for row in results if row.name.startswith('modern_')]
+        if not rows:
+            continue
+        print("\n-- Python %s --" % version)
+        for row in rows:
+            modern_total += 1
+            modern_ok += bool(row.ok)
+            print("  %-38s %s" % (row.name, 'OK' if row.ok else 'DIFF'))
+            for diff in row.diffs if VERBOSE else row.diffs[:2]:
+                print("      " + diff)
+    print("\n%d/%d checks passed" % (modern_ok, modern_total))
+    failed += modern_total - modern_ok
 
     print()
     print("=" * 60)

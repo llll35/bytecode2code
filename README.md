@@ -102,6 +102,8 @@ tests/
   samples/              .pyc fixtures (tracked: they need the exact compiler)
   selftest.py           cross-version suite driven by main.py
   test_cfg.py           CFG / Rewriter / output-normalisation units
+  control_flow_cases.py shared modern control-flow scenarios
+  test_modern_control_flow.py exception-region and behaviour checks for 3.11–3.13
   repro/                one-off reproduction inputs
 
 embed_python/           the seven CPython interpreters (not tracked)
@@ -164,9 +166,11 @@ BYTECODE2CODE_TESTS_GROUP=3.10 BYTECODE2CODE_TESTS_OUT=results.json \
   embed_python/python-3.10/python.exe tests/run.py
 ```
 
-The report has two halves. **ROUND-TRIP** recompiles the recovered source and
-diffs the two disassemblies; **CONTROL FLOW** is the block-boundary corpus, the
-stricter gate. Both are tracked in the tables at the top of `bugs.md`.
+The report includes **ROUND-TRIP** checks, **CONTROL FLOW** block-boundary
+probes, and combined control-flow checks for Python 3.11–3.13. The combined
+suite compares structure and observable behavior across 81 scenarios and is
+run under each target interpreter. Results and known limitations are tracked
+in `bugs.md`.
 
 ## Limitations
 
@@ -174,11 +178,8 @@ Recovering source from bytecode is a best-effort reconstruction. The following
 are known to be imperfect; each is covered by a test or an allow-list in
 `tests/selftest.py`:
 
-* **Control flow inside `try`/`finally` loops.** A `break` or `continue` that
-  leaves a `try` body is not yet recovered on every version, and a `return`
-  inside a `try`/`finally` is only recovered when the body is otherwise empty.
-* **Round-trip coverage.** 234 of 263 round-trips pass; the remainder are
-  listed per version in `bugs.md`.
+* **Round-trip coverage.** The current corpus passes 263/263 round-trip checks;
+  source fidelity can still differ for some samples, as listed in `bugs.md`.
 * **Stringified annotations.** `from __future__ import annotations` stores
   annotations as source text, which is recovered by re-parsing.
 * **Unreachable code.** Statements the compiler proved dead are not in the

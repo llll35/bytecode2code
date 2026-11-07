@@ -17,11 +17,11 @@ _GET_INSTRUCTIONS_KWARGS = (
 def _line_of(instr: dis.Instruction) -> Optional[int]:
     """Source line an instruction belongs to.
 
-    ``dis.Instruction.starts_line`` was deprecated in 3.12 and removed in
-    3.13, where the number moved to ``positions.lineno``.
+    In 3.13 ``starts_line`` is a boolean flag; the actual number lives in
+    ``positions.lineno``. Older versions still expose the number directly.
     """
     line = getattr(instr, "starts_line", None)
-    if line is not None:
+    if line is not None and not isinstance(line, bool):
         return line
     positions = getattr(instr, "positions", None)
     if positions is not None:
@@ -40,6 +40,11 @@ class Instruction:
     line_no: Optional[int] = None
     is_jump_target: bool = False
     synthetic_loop_exit: bool = False
+    # Original exception-table target, independent of rewritten addresses.
+    block_id: Optional[int] = None
+    # Optional PEP 657 span for copied exits and loop-else boundaries.
+    positions: Any = None
+    protected_by: Optional[Tuple[int, ...]] = None
 
     def __str__(self):
         parts = []
@@ -175,6 +180,7 @@ class Disassembler:
                 argrepr=argrepr,
                 line_no=line_no,
                 is_jump_target=is_jump,
+                positions=getattr(instr, "positions", None),
             ))
         return instructions
 

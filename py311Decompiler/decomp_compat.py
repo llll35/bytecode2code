@@ -440,6 +440,13 @@ class Decompiler310(_BaseDecompiler):
         if len(stmts) == before or not isinstance(stmts[-1], (ast.With, ast.AsyncWith)):
             return consumed
         handler_start = self._find_target_idx(instructions, self._jump_target(instr))
+        if (handler_start < len(instructions)
+                and instructions[handler_start].opname == "WITH_EXCEPT_START"
+                and instructions[handler_start].block_id is not None):
+            return consumed
+        if (handler_start >= len(instructions)
+                or instructions[handler_start].offset != self._jump_target(instr)):
+            return consumed
         pop_idx = self._find_pop_block(instructions, idx, self._jump_target(instr))
         if not (idx < pop_idx <= handler_start):
             return consumed

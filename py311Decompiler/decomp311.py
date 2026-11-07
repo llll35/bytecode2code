@@ -27,8 +27,7 @@ syntactic; the decompiler keeps doing all the work.
 import dis
 import sys
 import ast
-from .disassembler import Instruction
-from .decompiler import _is_bare_return
+from .disassembler import Instruction, _line_of
 
 from .decomp_compat import Decompiler310
 
@@ -311,6 +310,13 @@ def _repr_of(opname, arg, argval):
     return str(argval)
 
 
+def _same_clause_op(a, b):
+    """Match clause text while ignoring checked-versus-plain fast loads."""
+    aliases = {'LOAD_FAST_CHECK': 'LOAD_FAST'}
+    return (aliases.get(a.opname, a.opname) == aliases.get(b.opname, b.opname)
+            and a.argval == b.argval)
+
+
 class _Shape(object):
     """What the single analysis pass decided about each instruction."""
 
@@ -396,6 +402,10 @@ class Rewriter(object):
                 if raw.argval is not None:
                     self.jump_targets.add(int(raw.argval))
         self._drops = set()
+        entries = _exception_entries(code)
+        self._exception_targets = {entry.target for entry in entries}
+        self._protected_by = {raw.offset: tuple(entry.target for entry in entries
+                              if entry.start <= raw.offset < entry.end) for raw in self.raw}
         self._retarget = {}
         #: Where a copy of the implicit return was dropped, and the address of
         #: the copy that stays -- a branch aimed at the former needs the latter.
@@ -411,6 +421,7 @@ class Rewriter(object):
         self._mark_dead_handlers()
         self._redirect_handler_exits()
         self._analyse_exception_loop_exits()
+        self._restore_loop_return_copies()
         self._retarget_dropped_epilogues()
 
     def _analyse_super(self):
@@ -585,6 +596,11 @@ class Rewriter(object):
             start = by_offset.get(entry.target)
             if start is None or entry.target in self._handler_heads:
                 continue
+            if raw_list[start].opname == 'CLEANUP_THROW':
+                self._drops.add(raw_list[start].offset)
+                if start + 1 < len(raw_list) and raw_list[start + 1].opname in _JUMP_OPS:
+                    self._drops.add(raw_list[start + 1].offset)
+                continue
             index = start
             while index < len(raw_list):
                 opname = raw_list[index].opname
@@ -630,7 +646,8 @@ class Rewriter(object):
         by_offset = {raw.offset: n for n, raw in enumerate(raw_list)}
         for entry in _exception_entries(self.code):
             start = by_offset.get(entry.target)
-            if start is None:
+            if (start is None or raw_list[start].opname != 'PUSH_EXC_INFO'
+                    or entry.target in self.with_targets):
                 continue
             for index in range(start, len(raw_list)):
                 raw = raw_list[index]
@@ -645,67 +662,218 @@ class Rewriter(object):
                 if target < entry.end:
                     # This is a real loop continue, not a duplicated tail.
                     break
+                handlers = set(self._try_handlers(entry)) - {entry.target}
+                if any(end == target and handlers.intersection(self._close_targets(anchor))
+                       for anchor, end in self.try_closes.items()):
+                    break
+                if any(target <= inner.start < entry.target
+                       and (inner.target < entry.target or inner.target in self._try_handlers(entry))
+                       for inner in _exception_entries(self.code)):
+                    break
                 # The code the handler jumps back to is the code that follows
                 # the whole ``try`` statement.  3.11/3.12 place it before the
                 # handler, where the reader would take it for the ``else``
                 # clause, so it is moved past the handler and the jump is
                 # re-aimed at its new home.
                 merge = self._merge_offset(entry)
-                self._retarget[raw.offset] = merge
                 self._save_tail_for_merge(target, merge)
+                saved = self._tails_at_merge.get(merge, ())
+                self._retarget[raw.offset] = next((ins.offset for ins in saved
+                    if ins.offset in self.try_setups or (ins.offset in self._tail_offsets
+                        and ins.opname not in DROPPED and ins.opname not in ('NOP', 'PUSH_NULL'))), target)
                 break
 
-    def _analyse_exception_loop_exits(self):
-        """Retarget handler back-edges past dropped loop-head NOPs.
-
-        Also restores the ``break`` a protected body ends with: 3.12 compiles
-        ``break`` at the end of a ``try`` body into nothing at all -- the region
-        stops at a ``NOP`` and control falls through into the code behind the
-        loop -- so the exit jump has to be named again or the reader never closes
-        the block.
-        """
+    def _handler_flow(self, entry):
+        """Follow this handler's normal successors, including shared latches."""
         raw_list = self.raw
-        by_offset = {raw.offset: index for index, raw in enumerate(raw_list)}
-        jump_ops = set(dis.hasjabs) | set(dis.hasjrel)
+        by_offset = {raw.offset: i for i, raw in enumerate(raw_list)}
+        start = by_offset.get(entry.target)
+        if start is None:
+            return []
+        pending, seen = [start], set()
+        terminal = {'RETURN_VALUE', 'RETURN_CONST', 'RAISE_VARARGS', 'RERAISE'}
+        while pending:
+            index = pending.pop()
+            while 0 <= index < len(raw_list) and index not in seen:
+                raw = raw_list[index]
+                if raw.offset < entry.target or (index != start and raw.opname == 'PUSH_EXC_INFO'):
+                    break
+                seen.add(index)
+                if raw.opname in terminal:
+                    break
+                if (raw.opname in _JUMP_OPS or raw.opname.startswith(('POP_JUMP', 'JUMP_IF'))
+                        or raw.opname in ('FOR_ITER', 'SEND')):
+                    target = by_offset.get(raw.argval)
+                    if target is not None:
+                        pending.append(target)
+                    if raw.opname in _JUMP_OPS:
+                        break
+                index += 1
+        return [raw_list[i] for i in sorted(seen)]
+
+    def _analyse_exception_loop_exits(self):
+        """Restore a threaded break, not a with close or a natural loop latch."""
+        raw_list = self.raw
+        by_offset = {raw.offset: i for i, raw in enumerate(raw_list)}
         for entry in _exception_entries(self.code):
-            if entry.start not in by_offset or entry.target not in by_offset:
+            handler, end = by_offset.get(entry.target), by_offset.get(entry.end)
+            if (handler is None or end is None or raw_list[end].opname != 'NOP'
+                    or entry.target in self.with_targets or entry.end in self.with_closes):
                 continue
-            loop_heads = set()
-            for raw in raw_list:
-                if raw.offset < entry.target or raw.opcode not in jump_ops \
-                        or not isinstance(raw.argval, int) \
-                        or raw.argval >= entry.start:
-                    continue
-                target = by_offset.get(raw.argval)
-                if target is not None and raw_list[target].opname == 'NOP':
-                    loop_heads.add(raw.argval)
-            if not loop_heads and not self._handler_reenters_loop(raw_list, entry):
-                # Nothing re-enters the code in front of the region, so the
-                # ``NOP`` behind it is padding, not a ``break``.
+            if any(other.target == entry.target and other.start < entry.target
+                   and other.end > entry.end for other in _exception_entries(self.code)):
                 continue
-            for loop_head in loop_heads:
-                target_index = by_offset[loop_head]
-                while target_index < len(raw_list) and raw_list[target_index].opname in (
-                    'NOP', 'RESUME', 'CACHE'
-                ):
-                    target_index += 1
-                if target_index >= len(raw_list):
-                    continue
-                target_offset = raw_list[target_index].offset
-                self.jump_targets.add(target_offset)
-                for raw in raw_list:
-                    if raw.opcode in jump_ops and raw.argval == loop_head:
-                        self._retarget[raw.offset] = target_offset
-            end = by_offset.get(entry.end)
-            if end is None or raw_list[end].opname != 'NOP':
+            flow = self._handler_flow(entry)
+            heads = {raw.argval for raw in flow if raw.opname in _JUMP_OPS
+                     and isinstance(raw.argval, int) and raw.argval < entry.start
+                     and raw.argval in by_offset}
+            if not heads:
+                continue
+            last = raw_list[end - 1]
+            if last.opname in ('RETURN_VALUE', 'RETURN_CONST', 'RAISE_VARARGS', 'RERAISE'):
+                continue
+            if (last.opname in _JUMP_OPS and isinstance(last.argval, int)
+                    and (last.argval in heads or last.argval >= entry.target)):
+                continue
+            if any(raw.opname in _JUMP_OPS and raw.argval in heads
+                   for raw in raw_list[end + 1:handler]):
                 continue
             exit_index = end + 1
-            while exit_index < len(raw_list) and raw_list[exit_index].opname in (
-                'NOP', 'RESUME', 'CACHE'
-            ):
+            while exit_index < len(raw_list) and (raw_list[exit_index].opname == 'NOP'
+                                                  or raw_list[exit_index].opname in DROPPED):
                 exit_index += 1
-            if exit_index < len(raw_list):
-                self._loop_breaks[raw_list[end].offset] = raw_list[exit_index].offset
+            if exit_index >= len(raw_list):
+                continue
+            self._loop_breaks[entry.end] = raw_list[exit_index].offset
+            head = min(heads)
+            index = by_offset[head]
+            while index < len(raw_list) and (raw_list[index].opname == 'NOP'
+                                             or raw_list[index].opname in DROPPED):
+                index += 1
+            if index < len(raw_list):
+                target = raw_list[index].offset
+                self.jump_targets.add(target)
+                for raw in flow:
+                    if raw.opname in _JUMP_OPS and raw.argval == head:
+                        self._retarget[raw.offset] = target
+
+    def _async_loop_spans(self):
+        """Real async iteration ranges, excluding the SEND suspension latches."""
+        by_offset = {ins.offset: i for i, ins in enumerate(self.raw)}
+        loops = []
+        for index, ins in enumerate(self.raw):
+            if ins.opname != 'GET_ANEXT':
+                continue
+            targets = [entry.target for entry in _exception_entries(self.code)
+                       if entry.start <= ins.offset < entry.end and entry.target in by_offset
+                       and self.raw[by_offset[entry.target]].opname == 'END_ASYNC_FOR']
+            if not targets:
+                continue
+            column = getattr(ins.positions, 'col_offset', None)
+            bind = next((raw for raw in self.raw[index + 1:index + 12] if raw.opname in _STORE_OPS), None)
+            if bind is not None and getattr(bind.positions, 'col_offset', None) is not None:
+                column = bind.positions.col_offset - 10
+            loops.append((ins.offset, min(targets), column))
+        return loops
+
+    def _restore_loop_return_copies(self):
+        """Restore breaks only when a copied return has the same source span."""
+        raw = self.raw
+        loops = [(ins.offset, ins.argval, getattr(ins.positions, 'col_offset', None))
+                 for ins in raw if ins.opname == 'FOR_ITER' and isinstance(ins.argval, int)]
+        loops.extend(self._async_loop_spans())
+        handler_heads = [ins.offset for ins in raw if ins.opname == 'PUSH_EXC_INFO']
+        by_offset = {ins.offset: ins for ins in raw}
+        loops.extend((ins.argval, ins.offset,
+                      getattr(getattr(by_offset.get(ins.argval), 'positions', None), 'col_offset', None))
+                     for ins in raw if (ins.opname in _JUMP_OPS or ins.opname.startswith('POP_JUMP'))
+                     and isinstance(ins.argval, int) and ins.argval < ins.offset
+                     and ins.opname != 'JUMP_BACKWARD_NO_INTERRUPT' and ins.offset not in self._drops
+                     and by_offset[ins.argval].opname not in ('FOR_ITER', 'GET_ANEXT', 'SEND', 'END_SEND')
+                     and not any(ins.argval <= h <= ins.offset for h in handler_heads))
+        handler_loops = []
+        for entry in _exception_entries(self.code):
+            for head, end, column in loops:
+                if head < entry.start < end <= entry.target:
+                    handler_loops.append((head, end, column, entry.target,
+                                          {ins.offset for ins in self._handler_flow(entry)}))
+        returns = []
+        for end, ins in enumerate(raw):
+            if ins.opname not in ('RETURN_VALUE', 'RETURN_CONST'):
+                continue
+            position = getattr(ins, 'positions', None)
+            if position is None or position.lineno is None:
+                continue
+            start = end
+            needed = 0 if ins.opname == 'RETURN_CONST' else 1
+            while needed and start > 0:
+                prev = raw[start - 1]
+                if (prev.opname in _STMT_BREAK_OPS or prev.opname.startswith(('JUMP', 'POP_JUMP'))
+                        or prev.opname in ('FOR_ITER', 'SEND', 'YIELD_VALUE')):
+                    break
+                needed -= _stack_effect(prev)
+                start -= 1
+            if not needed:
+                returns.append((start, end, position))
+        for start, end, position in returns:
+            if raw[start].offset in self._drops:
+                continue
+            for tail, tail_end, other_position in returns:
+                if (tail == start or other_position != position or end - start != tail_end - tail
+                        or raw[tail].offset in self._loop_breaks):
+                    continue
+                eligible = [column for head, latch, column in loops
+                            if head <= raw[start].offset < latch <= raw[tail].offset]
+                eligible.extend(column for head, latch, column, handler, offsets in handler_loops
+                                if raw[start].offset in offsets and latch <= raw[tail].offset < handler)
+                if not any(column is None or position.col_offset is None
+                           or position.col_offset <= column for column in eligible):
+                    continue
+                if not all(_same_clause_op(a, b) for a, b in zip(
+                        raw[start:end + 1], raw[tail:tail_end + 1])):
+                    continue
+                self._loop_breaks[raw[start].offset] = raw[tail].offset
+                self.jump_targets.add(raw[tail].offset)
+                self._drops.update(ins.offset for ins in raw[start + 1:end + 1])
+                break
+
+        self._restore_shared_return_tails(loops, returns)
+
+    def _restore_shared_return_tails(self, loops, returns):
+        """Unthread a single post-loop return shared by break and else exits."""
+        by_offset = {raw.offset: i for i, raw in enumerate(self.raw)}
+        for start, end, position in returns:
+            if start == 0 or self.raw[start].offset in self._drops:
+                continue
+            previous = self.raw[start - 1]
+            if previous.opname not in ('POP_TOP', 'POP_ITER'):
+                continue
+            for head, stop, column in loops:
+                loop = self.raw[by_offset[head]]
+                if loop.opname not in ('FOR_ITER', 'GET_ANEXT') or not head < self.raw[start].offset < stop:
+                    continue
+                return_column = position.col_offset
+                if self.raw[end].opname == 'RETURN_CONST' and sys.version_info[:2] >= (3, 13) and return_column is not None:
+                    return_column -= 7
+                if column is not None and return_column is not None and return_column > column:
+                    continue
+                last_line = getattr(loop.positions, 'end_lineno', None)
+                if last_line is None or position.lineno <= last_line:
+                    continue
+                jump = next((i for i, raw in enumerate(self.raw) if raw.offset >= stop
+                             and raw.opname in _JUMP_OPS and raw.argval == self.raw[start].offset), None)
+                if jump is None or jump + 1 >= len(self.raw):
+                    continue
+                anchor = self.raw[jump + 1].offset
+                tail = self.raw[start:end + 1]
+                self._tails_at_merge = getattr(self, '_tails_at_merge', {})
+                self._tails_at_merge.setdefault(anchor, []).extend(tail)
+                self._tail_offsets = getattr(self, '_tail_offsets', set())
+                self._tail_offsets.update(raw.offset for raw in tail if raw.offset not in self._drops)
+                self._drops.update(raw.offset for raw in tail)
+                self._loop_breaks[previous.offset] = self.raw[start].offset
+                self.jump_targets.add(self.raw[start].offset)
+                break
 
     def _handler_reenters_loop(self, raw_list, entry):
         """Whether the clause chain ends by continuing the loop around it.
@@ -760,6 +928,13 @@ class Rewriter(object):
                 self._drops.add(raw.offset)
                 self._tail_offsets.add(raw.offset)
 
+    def _try_handlers(self, entry):
+        """Every handler owned by this protected statement."""
+        for handlers in self.try_setups.values():
+            if entry.target in handlers:
+                return handlers
+        return [entry.target]
+
     def _merge_offset(self, entry):
         """Offset just past every handler block belonging to *entry*.
 
@@ -769,8 +944,21 @@ class Rewriter(object):
         """
         raw_list = self.raw
         entries = _exception_entries(self.code)
-        end = max(other.end for other in entries
-                  if other.target >= entry.target)
+        pending = list(self._try_handlers(entry))
+        seen, offsets = set(), set()
+        while pending:
+            target = pending.pop()
+            if target in seen:
+                continue
+            seen.add(target)
+            owner = next((other for other in entries if other.target == target), None)
+            if owner is None:
+                continue
+            flow = self._handler_flow(owner)
+            offsets.update(raw.offset for raw in flow)
+            pending.extend(other.target for other in entries if other.lasti
+                           and any(other.start <= raw.offset < other.end for raw in flow))
+        end = max(offsets, default=entry.target) + 2
         index = 0
         while index < len(raw_list) and raw_list[index].offset < end:
             index += 1
@@ -779,7 +967,7 @@ class Rewriter(object):
         # real code.  Stopping at the first non-noise insn would land inside
         # the cleanup handler (e.g. at RERAISE 1) for 3.12 module-level code.
         while index < len(raw_list) and (
-                raw_list[index].opname in _HANDLER_NOISE
+                raw_list[index].opname in _HANDLER_NOISE - {'PUSH_EXC_INFO'}
                 or raw_list[index].opname == 'RERAISE'):
             index += 1
         if index >= len(raw_list):
@@ -853,6 +1041,8 @@ class Rewriter(object):
         """
         inner = Rewriter.__new__(Rewriter)
         inner.code = self.code
+        inner._protected_by = self._protected_by
+        inner._exception_targets = self._exception_targets
         inner.raw = self.raw[start:end]
         inner.attr_method_bit = self.attr_method_bit
         inner.jump_targets = self.jump_targets
@@ -864,6 +1054,9 @@ class Rewriter(object):
         inner.with_exits = set()
         inner.try_setups = {}
         inner.try_closes = {}
+        inner.close_extras = {}
+        inner._close_owner = {}
+        inner._extra_close_owners = {}
         inner.try_before = {}
         inner.try_replace = {}
         inner.name_closes = {}
@@ -877,7 +1070,7 @@ class Rewriter(object):
         inner._redirect_handler_exits()
         return inner.run()
 
-    def _reachable_offsets(self):
+    def _reachable_offsets(self, start_offset=0):
         """Offsets reachable from the entry along ordinary control flow.
 
         Exception handlers are entered by the interpreter rather than by a
@@ -886,7 +1079,7 @@ class Rewriter(object):
         which is what tells it apart from the body's own close.
         """
         cached = getattr(self, "_reachable_cache", None)
-        if cached is not None:
+        if cached is not None and start_offset == 0:
             return cached
         raw_list = self.raw
         by_offset = {r.offset: n for n, r in enumerate(raw_list)}
@@ -903,7 +1096,7 @@ class Rewriter(object):
         terminal = {"RETURN_VALUE", "RETURN_CONST", "RAISE_VARARGS",
                     "RERAISE"}
         seen = set()
-        work = [0]
+        work = [by_offset[start_offset]] if start_offset in by_offset else []
         while work:
             i = work.pop()
             while 0 <= i < n and i not in seen:
@@ -925,7 +1118,8 @@ class Rewriter(object):
                     continue
                 i += 1
         result = {raw_list[i].offset for i in seen}
-        self._reachable_cache = result
+        if start_offset == 0:
+            self._reachable_cache = result
         return result
 
     def _analyse_with(self):
@@ -959,6 +1153,9 @@ class Rewriter(object):
         swaps = set()
         exits = set()
         self.async_with_setups = {}
+        self._with_handler_markers = set()
+        self._with_close_owner = {}
+        body_starts = {}
         for entry in _exception_entries(self.code):
             start = by_offset.get(entry.start)
             if start is None or start == 0:
@@ -974,7 +1171,9 @@ class Rewriter(object):
             if ops[:2] != ['PUSH_EXC_INFO', 'WITH_EXCEPT_START']:
                 continue
             setups[self.raw[setup].offset] = self.raw[handler + 1].offset
+            self._with_handler_markers.add(self.raw[handler + 1].offset)
             targets.add(entry.target)
+            body_starts[entry.target] = entry.start
             if self.raw[setup].opname == 'BEFORE_ASYNC_WITH':
                 # 3.9 opened the block *after* awaiting ``__aenter__()``.
                 self.async_with_setups[self.raw[start].offset] = \
@@ -990,19 +1189,14 @@ class Rewriter(object):
         # ``with a as x, b as y:`` -- the outer block then reads as ending
         # inside the handler tail and the 3.9 walk runs off the stream.
         handler_targets = {e.target for e in _exception_entries(self.code)}
+        body_reachable = {target: self._reachable_offsets(start)
+                          for target, start in body_starts.items()}
         for entry in _exception_entries(self.code):
             if entry.target not in targets or entry.end >= entry.target:
                 continue
             if any(entry.start <= t < entry.end
-                   for t in handler_targets if t != entry.target):
-                continue
-            # A range that begins at or after another ``with`` handler's head
-            # is the outer manager's ``__exit__`` run while the nested block
-            # unwinds -- not the body's own close.  It can be reachable (the
-            # nested handler's normal exit jumps to it), so the reachability
-            # test below does not catch it; anchoring there parks the outer
-            # ``POP_BLOCK`` inside the handler tail.
-            if any(entry.start >= t for t in targets if t != entry.target):
+                   for t in handler_targets if t != entry.target) \
+                    and entry.end not in body_reachable.get(entry.target, ()):
                 continue
             position = by_offset.get(entry.end)
             if position is None:
@@ -1026,14 +1220,15 @@ class Rewriter(object):
         reachable = self._reachable_offsets()
         resolved = []
         for target, candidates in ends.items():
-            on_path = [e for e in candidates if e in reachable]
+            on_path = [e for e in candidates if e in body_reachable.get(target, reachable)]
             end = max(on_path) if on_path else max(candidates)
             position = by_offset.get(end)
             if position is None:
                 continue
-            resolved.append((end, position))
-        for end, position in sorted(resolved):
+            resolved.append((end, position, self.raw[by_offset[target] + 1].offset))
+        for end, position, owner in sorted(resolved):
             closes[end] = end
+            self._with_close_owner[end] = owner
             if self.raw[position].opname == 'SWAP':
                 swaps.add(end)
             exit_call = self._find_exit_call(position)
@@ -1070,21 +1265,35 @@ class Rewriter(object):
         with_targets = getattr(self, "with_targets", set())
         if not with_targets:
             return
-        pinned = {entry.start for entry in _exception_entries(self.code)
-                  if entry.target in with_targets}
+        pinned = {offset for entry in _exception_entries(self.code)
+                  if entry.target in with_targets for offset in (entry.start, entry.end)}
         for index, raw in enumerate(raw_list):
             if raw.opname != "LOAD_CONST" or raw.argval is not None:
                 continue
-            call = raw_list[index + 3] if index + 3 < len(raw_list) else None
-            after = raw_list[index + 4] if index + 4 < len(raw_list) else None
-            if call is None or call.opname not in ("CALL", "CALL_KW"):
+            if index + 3 >= len(raw_list) or not all(
+                    ins.opname == 'LOAD_CONST' and ins.argval is None
+                    for ins in raw_list[index:index + 3]):
                 continue
-            if after is None or after.opname != "POP_TOP":
+            call_index = index + 3
+            if raw_list[call_index].opname == 'PRECALL':
+                call_index += 1
+            if call_index >= len(raw_list):
+                continue
+            call = raw_list[call_index]
+            if call.opname not in ('CALL', 'CALL_KW'):
                 continue
             if call.offset in self.with_exits:
                 continue    # the body's own close, folded already
-            if not all(next_.opname == "LOAD_CONST" and next_.argval is None
-                       for next_ in raw_list[index:index + 3]):
+            after = call_index + 1
+            if after < len(raw_list) and raw_list[after].opname == 'GET_AWAITABLE':
+                after += 1
+                if after < len(raw_list) and raw_list[after].opname == 'LOAD_CONST':
+                    after += 1
+                if after < len(raw_list) and raw_list[after].opname == 'SEND':
+                    after = self._skip_send_loop(after)
+                if after < len(raw_list) and raw_list[after].opname == 'END_SEND':
+                    after += 1
+            if after >= len(raw_list) or raw_list[after].opname != 'POP_TOP':
                 continue
             pred = raw_list[index - 1] if index else None
             pinned_here = raw.offset in pinned
@@ -1093,7 +1302,7 @@ class Rewriter(object):
                 or (pred.opname == "LOAD_CONST" and pred.argval is None))
             if not (pinned_here or pred_ok):
                 continue
-            self._drops.update(next_.offset for next_ in raw_list[index:index + 5])
+            self._drops.update(next_.offset for next_ in raw_list[index:after + 1])
 
     def _with_setup_index(self, index):
         """Index of the ``BEFORE_WITH`` that opens the block *index* belongs to.
@@ -1146,7 +1355,7 @@ class Rewriter(object):
         raw_list = self.raw
         index = position
         while index < len(raw_list) and raw_list[index].opname in (
-                'SWAP', 'COPY', 'ROT_TWO', 'ROT_THREE', 'ROT_FOUR'):
+                'SWAP', 'COPY', 'ROT_TWO', 'ROT_THREE', 'ROT_FOUR', 'NOP', 'EXTENDED_ARG'):
             index += 1
         operands = 0
         while index < len(raw_list) \
@@ -1180,7 +1389,15 @@ class Rewriter(object):
         index = handler
         tail: List[str] = []
         while index < len(raw_list):
-            opname = raw_list[index].opname
+            opname = POP_JUMP_ALIASES.get(raw_list[index].opname, raw_list[index].opname)
+            if opname == 'SEND':
+                index = self._skip_send_loop(index)
+                continue
+            if opname in ('GET_AWAITABLE', 'END_SEND', 'EXTENDED_ARG') or (
+                    opname == 'LOAD_CONST' and raw_list[index].argval is None
+                    and index + 1 < len(raw_list) and raw_list[index + 1].opname == 'SEND'):
+                index += 1
+                continue
             if opname == 'RETURN_CONST':
                 self._drops.update(
                     raw.offset for raw in raw_list[handler:index + 1]
@@ -1197,9 +1414,11 @@ class Rewriter(object):
             if opname in ('JUMP_BACKWARD', 'JUMP_BACKWARD_NO_INTERRUPT'):
                 # The handler resumes the code behind the block, so the jump
                 # points back into the enclosing body.
-                self._drops.update(
-                    raw.offset for raw in raw_list[handler:index + 1]
-                )
+                prefix = index
+                while prefix > handler and raw_list[prefix - 1].opname == 'EXTENDED_ARG':
+                    prefix -= 1
+                shared = any(raw.offset in self.jump_targets for raw in raw_list[prefix:index + 1])
+                self._drops.update(raw.offset for raw in raw_list[handler:prefix if shared else index + 1])
                 return
             # Everything a ``with`` handler legitimately contains on the way out.
             if opname in _WITH_TAIL_OPS:
@@ -1385,12 +1604,23 @@ class Rewriter(object):
                 self.empty_body_setups.add((start_off, entry.start))
                 break
         setups = self._place_block_setups(entries, blocks)
+        self.try_setups = setups
         self.try_closes = closes
         self._analyse_handlers()
         self._redirect_handler_epilogues()
         self._place_block_closes(setups, closes)
+        for head, normal_pop, normal_exit in self._exception_group_exits:
+            group_entry = next(entry for entry in entries if entry.target == head)
+            enclosing = set(self._try_handlers(group_entry)) - {head}
+            for anchor in list(closes):
+                for owner in self._close_targets(anchor):
+                    if owner not in enclosing or not head <= anchor < owner:
+                        continue
+                    end = closes[anchor]
+                    self._remove_close_owner(closes, anchor, owner)
+                    self._register_close(closes, normal_pop, end, owner)
         for end, target in self.name_closes.items():
-            closes[end] = target
+            self._register_close(closes, end, target, target)
         return setups, closes
 
     def _is_finally_copy(self, start_idx, h_idx):
@@ -1500,9 +1730,9 @@ class Rewriter(object):
             for entry in entries:
                 if entry.target == target or entry.start >= begins:
                     continue
-                if not begins <= entry.target < target:
+                if entry.target >= target:
                     continue
-                if entry.end == begins or (entry.target in heads
+                if (entry.end == begins and begins <= entry.target) or (entry.target in heads
                                            and (depth is None
                                                 or entry.depth == depth)
                                            and self._handler_reaches(
@@ -1576,13 +1806,80 @@ class Rewriter(object):
         """
         raw_list = self.raw
         entries = _exception_entries(self.code)
+        self._close_owner = {}
+        self.close_extras = {}
+        self._extra_close_owners = {}
+        self._pre_closes = {}
         for begins, targets in setups.items():
-            for target in targets:
+            for target in reversed(targets):
                 self._place_one_close(entries, raw_list, begins, target,
                                       closes)
+        self._share_body_close(entries, setups, raw_list, closes)
         self._place_exit_closes(entries, raw_list, closes)
         for key in [k for k in closes if k in self.with_closes]:
             del closes[key]
+
+    def _share_body_close(self, entries, setups, raw_list, closes):
+        """Share closes inside-out, preserving independent inline clauses."""
+        for targets in setups.values():
+            for inner, outer in zip(reversed(targets[1:]), reversed(targets[:-1])):
+                if inner in getattr(self, '_exception_group_heads', ()):
+                    continue
+                pre = next((offset for offset, owners in self._pre_closes.items() if inner in owners), None)
+                if pre is not None:
+                    other = next((offset for offset in closes if outer in self._close_targets(offset)), None)
+                    if other is not None and other >= inner:
+                        self._remove_close_owner(closes, other, outer)
+                        owners = self._pre_closes[pre]
+                        if outer not in owners:
+                            owners.append(outer)
+                            owners.sort()
+                    continue
+                anchors = {owner: offset for offset in closes for owner in self._close_targets(offset)}
+                anchor, other = anchors.get(inner), anchors.get(outer)
+                if anchor is None or other is None or anchor == other or other < inner:
+                    continue
+                index = self._offset_index(anchor)
+                if index is None:
+                    continue
+                index += 1
+                while index < len(raw_list) and raw_list[index].offset in self._drops:
+                    index += 1
+                if index < len(raw_list) and raw_list[index].opname in ('JUMP_FORWARD', 'JUMP_ABSOLUTE'):
+                    continue
+                end = closes[other]
+                self._remove_close_owner(closes, other, outer)
+                self._register_close(closes, anchor, end, outer)
+
+    def _close_targets(self, anchor):
+        """Block identities closed at an anchor, in unwind order."""
+        owner = self._close_owner.get(anchor)
+        return ([owner] if owner is not None else []) + list(self._extra_close_owners.get(anchor, ()))
+
+    def _register_close(self, closes, anchor, end, target):
+        """Add a close without overwriting another region at the same anchor."""
+        if anchor not in closes:
+            closes[anchor] = end
+            self._close_owner[anchor] = target
+        elif target not in self._close_targets(anchor):
+            owners = sorted(self._close_targets(anchor) + [target])
+            self._close_owner[anchor] = owners[0]
+            self._extra_close_owners[anchor] = owners[1:]
+            self.close_extras[anchor] = len(owners) - 1
+
+    def _remove_close_owner(self, closes, anchor, target):
+        """Remove only one owner, promoting any remaining shared close."""
+        owners = [owner for owner in self._close_targets(anchor) if owner != target]
+        self.close_extras.pop(anchor, None)
+        self._extra_close_owners.pop(anchor, None)
+        if not owners:
+            closes.pop(anchor, None)
+            self._close_owner.pop(anchor, None)
+            return
+        self._close_owner[anchor] = owners[0]
+        if len(owners) > 1:
+            self._extra_close_owners[anchor] = owners[1:]
+            self.close_extras[anchor] = len(owners) - 1
 
     def _place_exit_closes(self, entries, raw_list, closes):
         """Anchor a ``POP_BLOCK`` in front of every other copy of a clause.
@@ -1612,9 +1909,11 @@ class Rewriter(object):
                 continue
             for start in self._clause_copies(raw_list, clause, h_idx, end):
                 anchor = self._close_anchor(raw_list, start)
-                if anchor is None or anchor in closes or anchor in self.with_closes:
+                if anchor is None or anchor in self.with_closes:
                     continue
-                closes[anchor] = end
+                if any(low <= anchor < high for low, high in self._unwind_stubs(entries)):
+                    continue
+                self._register_close(closes, anchor, end, target)
 
     def _close_anchor(self, raw_list, start):
         """Offset of the instruction a ``POP_BLOCK`` can follow.
@@ -1667,9 +1966,9 @@ class Rewriter(object):
                                 for low, high in stubs):
             index -= 1
         anchor = raw_list[index].offset
-        if anchor in closes or anchor in self.with_closes:
+        if anchor in self.with_closes:
             return
-        closes[anchor] = target
+        self._register_close(closes, anchor, target, target)
 
     def _clause_shape(self, raw_list, h_idx):
         """The ``(opname, argval)`` pairs the handler at *h_idx* runs.
@@ -1712,11 +2011,16 @@ class Rewriter(object):
         # after it are that handler's unwinding code, which the table sends
         # here as well.
         nested = [e.target for e in entries
-                  if e.target != target and start < e.target <= target
-                  and e.target in self.with_targets]
+                  if e.target != target and start < e.target <= target]
         limit = min(nested) if nested else target
+        stub_starts = {low for low, _ in self._unwind_stubs(entries)}
         spans = [e for e in entries
-                 if e.target == target and start <= e.start < limit]
+                 if e.target == target and start <= e.start < limit and e.start not in stub_starts]
+        reachable = self._reachable_offsets(start)
+        normal_spans = [e for e in entries if e.target == target and start <= e.start < target
+                        and e.start in reachable and e.start not in stub_starts]
+        if normal_spans:
+            spans = normal_spans
         if not spans:
             # Nothing the table protects for this handler begins before the
             # nested block that shares it: the outer ``try``'s whole body *is*
@@ -1738,15 +2042,56 @@ class Rewriter(object):
             index = len(raw_list)
         stubs = self._unwind_stubs(entries)
         while index > 0 and (raw_list[index - 1].offset in self._drops
+                             or raw_list[index - 1].offset not in reachable
+                             or raw_list[index - 1].opname in DROPPED
+                             or raw_list[index - 1].opname == 'NOP'
                              or any(lo <= raw_list[index - 1].offset < hi
                                     for lo, hi in stubs)):
             index -= 1
         if index == 0:
             return
         close_at = raw_list[index - 1].offset
-        if close_at in closes or close_at in self.with_closes:
+        last = raw_list[index - 1]
+        if last.opname in _JUMP_OPS and isinstance(last.argval, int) and last.argval < last.offset:
+            head = self._offset_index(last.argval)
+            if head is not None and raw_list[head].opname == 'FOR_ITER' and start < last.argval:
+                exit_offset = raw_list[head].argval
+                if last.offset < exit_offset < target:
+                    owners = self._pre_closes.setdefault(exit_offset, [])
+                    if target not in owners:
+                        owners.append(target)
+                        owners.sort()
+                    return
+        if last.opname in _JUMP_OPS and isinstance(last.argval, int) and last.argval >= end:
+            closing_point = last.offset
+            index -= 1
+            while index > 0 and (raw_list[index - 1].offset in self._drops
+                                 or raw_list[index - 1].offset not in reachable
+                                 or raw_list[index - 1].opname in _SILENT
+                                 or any(low <= raw_list[index - 1].offset < high for low, high in stubs)
+                                 or (raw_list[index - 1].opname in _JUMP_OPS
+                                     and isinstance(raw_list[index - 1].argval, int)
+                                     and raw_list[index - 1].argval >= closing_point)):
+                if raw_list[index - 1].opname in _JUMP_OPS:
+                    closing_point = raw_list[index - 1].offset
+                index -= 1
+            if index == 0:
+                return
+            close_at = raw_list[index - 1].offset
+        if close_at in self.with_closes:
             return
-        closes[close_at] = end
+        last = raw_list[index - 1]
+        if last.opname in _JUMP_OPS and isinstance(last.argval, int) and last.argval < last.offset:
+            head = self._offset_index(last.argval)
+            if head is not None and raw_list[head].opname == 'FOR_ITER' and start < last.argval:
+                exit_offset = raw_list[head].argval
+                if last.offset < exit_offset < target:
+                    owners = self._pre_closes.setdefault(exit_offset, [])
+                    if target not in owners:
+                        owners.append(target)
+                        owners.sort()
+                    return
+        self._register_close(closes, close_at, end, target)
 
     #: Opcodes that may build the exception type in front of ``CHECK_EXC_MATCH``.
     _TYPE_LOADS = frozenset((
@@ -1786,6 +2131,99 @@ class Rewriter(object):
             j += 1
         return False
 
+    def _rewrite_exception_group(self, head):
+        """Expose except-star suites without subgroup split/merge machinery."""
+        raw = self.raw
+        entries = _exception_entries(self.code)
+        by_offset = {ins.offset: i for i, ins in enumerate(raw)}
+        index = by_offset[head] + 1
+        while index < len(raw) and raw[index].opname in ('COPY', 'SWAP', 'BUILD_LIST'):
+            index += 1
+        clauses, prefix = [], by_offset[head]
+        while index < len(raw):
+            type_start = check = index
+            while check < len(raw) and raw[check].opname in self._TYPE_LOADS:
+                check += 1
+            if check >= len(raw) or raw[check].opname != 'CHECK_EG_MATCH':
+                return False
+            dispatch = check + 1
+            while dispatch < len(raw) and raw[dispatch].opname in ('COPY', 'EXTENDED_ARG'):
+                dispatch += 1
+            if dispatch >= len(raw) or 'IF_NONE' not in raw[dispatch].opname:
+                return False
+            no_match = by_offset.get(raw[dispatch].argval)
+            if no_match is None or no_match <= dispatch:
+                return False
+            bind = dispatch + 1
+            name = raw[bind].argval if raw[bind].opname in _STORE_OPS else None
+            body = bind + 1
+
+            def collector(offset):
+                start = by_offset.get(offset)
+                if start is None:
+                    return False
+                run = raw[start:start + (4 if name is not None else 1)]
+                if name is not None:
+                    if (len(run) != 4 or run[0].opname != 'LOAD_CONST' or run[0].argval is not None
+                            or run[1].opname not in _STORE_OPS or run[1].argval != name
+                            or not run[2].opname.startswith('DELETE_') or run[2].argval != name):
+                        return False
+                return run[-1].opname == 'LIST_APPEND' and run[-1].arg == 3
+
+            spans = [entry for entry in entries if raw[body].offset <= entry.start < raw[no_match].offset
+                     and entry.end <= raw[no_match].offset and collector(entry.target)]
+            if spans:
+                body_end = by_offset[max(entry.end for entry in spans)]
+            else:
+                body_end = body
+                while body_end < no_match and raw[body_end].opname in ('NOP', 'EXTENDED_ARG'):
+                    body_end += 1
+            if not body <= body_end <= no_match:
+                return False
+            clauses.append((prefix, type_start, check, dispatch, bind, body, body_end, no_match, name))
+            index = no_match + 1
+            if index < len(raw) and raw[index].opname in self._TYPE_LOADS:
+                prefix = no_match
+                continue
+            break
+        prep = index
+        while prep < len(raw) and raw[prep].opname in ('LIST_APPEND', 'EXTENDED_ARG'):
+            prep += 1
+        if prep >= len(raw) or not (raw[prep].opname == 'PREP_RERAISE_STAR'
+                                   or raw[prep].opname == 'CALL_INTRINSIC_2' and raw[prep].arg == 1):
+            return False
+        normal_pop = prep + 1
+        while normal_pop < len(raw) and raw[normal_pop].opname != 'POP_EXCEPT':
+            normal_pop += 1
+        if normal_pop + 1 >= len(raw):
+            return False
+        exit_index = normal_pop + 1
+        cleanup = [entry.target for entry in entries if entry.start <= head < entry.end and entry.lasti]
+        chain_end = min(cleanup) if cleanup else raw[exit_index].offset + 2
+        after_cleanup = by_offset.get(chain_end, exit_index + 1)
+        while after_cleanup < len(raw) and raw[after_cleanup].opname in ('COPY', 'POP_EXCEPT', 'RERAISE'):
+            after_cleanup += 1
+        finish = raw[after_cleanup].offset if after_cleanup < len(raw) else chain_end + 6
+        self._exception_group_exits.append((head, raw[normal_pop].offset, finish))
+        for prefix, type_start, check, dispatch, bind, body, body_end, no_match, name in clauses:
+            self._drops.update(ins.offset for ins in raw[prefix:type_start])
+            self.try_replace[raw[prefix].offset] = [('DUP_TOP', None, head)]
+            self._drops.discard(raw[prefix].offset)
+            self.try_replace[raw[check].offset] = [('JUMP_IF_NOT_EG_MATCH', None, raw[no_match].offset)]
+            self._drops.update(ins.offset for ins in raw[check + 1:bind])
+            self.try_replace[raw[bind].offset] = (
+                [('POP_TOP', None, None), (raw[bind].opname, raw[bind].arg, name), ('POP_TOP', None, None)]
+                if name is not None else [('POP_TOP', None, None)] * 3)
+            self._drops.update(ins.offset for ins in raw[body_end:no_match])
+            self.try_replace[raw[body_end].offset] = [('END_EXCEPT_STAR_BODY', None, head)]
+            self._drops.discard(raw[body_end].offset)
+        last = clauses[-1][7]
+        self.try_replace[raw[last].offset] = [('END_EXCEPT_STAR_CHAIN', None, raw[normal_pop].offset)]
+        self._drops.discard(raw[last].offset)
+        self._drops.update(ins.offset for ins in raw[last + 1:normal_pop])
+        self._drops.update(ins.offset for ins in raw[exit_index + 1:after_cleanup])
+        return True
+
     def _analyse_handlers(self):
         """Rewrite the 3.11 handler dispatch into the 3.9 ``DUP_TOP`` shape.
 
@@ -1807,11 +2245,18 @@ class Rewriter(object):
         before = self.try_before
         replace = self.try_replace
         entries = _exception_entries(self.code)
+        self._exception_group_heads = set()
+        self._exception_group_exits = []
+        visited = set()
         for entry in entries:
             index = by_offset.get(entry.target)
-            if index is None or raw_list[index].opname != 'PUSH_EXC_INFO':
+            if (index is None or raw_list[index].opname != 'PUSH_EXC_INFO' or entry.target in visited):
                 continue
+            visited.add(entry.target)
             self._handler_heads.add(entry.target)
+            if self._rewrite_exception_group(entry.target):
+                self._exception_group_heads.add(entry.target)
+                continue
             if self._is_finally_handler(raw_list, index):
                 # A ``finally`` handler is not a clause of an ``except`` chain:
                 # it runs the clause and re-raises.  3.9 wrote it without the
@@ -1869,7 +2314,7 @@ class Rewriter(object):
                                                      body)
                         if cleanup is not None:
                             tail.append(('SETUP_FINALLY', None, cleanup))
-                            body_end = self._name_body_end(entries, body)
+                            body_end = self._name_body_end(entries, body, cleanup)
                             if body_end is None:
                                 # An empty handler body closes the implicit
                                 # block straight away.
@@ -1908,6 +2353,8 @@ class Rewriter(object):
                        and raw_list[by_offset[e.target]].opname == 'PUSH_EXC_INFO')
         for head in heads:
             index = by_offset[head]
+            if self._is_finally_handler(raw_list, index):
+                continue
             # The copy belongs to the region in front of this handler, so the
             # search stops at the handler before it -- whose own epilogue and
             # body are none of this block's business.
@@ -1929,6 +2376,12 @@ class Rewriter(object):
         """Drop the ``return None`` pair starting at *index*, if that is one."""
         step = self._return_none_at(index)
         if step is None:
+            return
+        if any(raw.opname == 'FOR_ITER' and raw.offset < self.raw[step].offset < raw.argval
+               for raw in self.raw) or any(head < self.raw[step].offset < end
+                                           for head, end, _ in self._async_loop_spans()):
+            # A None return inside a loop is an abrupt exit (possibly a
+            # threaded break), not the function's implicit fallthrough tail.
             return
         copied = [self.raw[step].offset]
         if self.raw[step].opname == 'LOAD_CONST':
@@ -2060,17 +2513,26 @@ class Rewriter(object):
         the compiler left empty has no entry of its own; there the copy is the
         first region the table mentions past the dispatch.
         """
-        fallback = None
-        for entry in entries:
-            if not entry.lasti or entry.start <= dispatch:
+        dispatch_index = self._offset_index(dispatch)
+        if dispatch_index is None or dispatch_index + 1 >= len(self.raw):
+            return None
+        name = self.raw[dispatch_index + 1].argval
+        limit = self.raw[dispatch_index].argval
+        candidates = sorted({offset for entry in entries if entry.lasti
+                             for offset in (entry.start, entry.target) if dispatch < offset < limit})
+        for offset in candidates:
+            index = self._offset_index(offset)
+            if index is None:
                 continue
-            if body is not None and entry.start == body.offset:
-                return entry.target
-            if fallback is None:
-                fallback = entry.start
-        return fallback
+            run = self.raw[index:index + 4]
+            if (len(run) == 4 and run[0].opname == 'LOAD_CONST' and run[0].argval is None
+                    and run[1].opname in _STORE_OPS and run[1].argval == name
+                    and run[2].opname.startswith('DELETE_') and run[2].argval == name
+                    and run[3].opname == 'RERAISE'):
+                return offset
+        return None
 
-    def _name_body_end(self, entries, body):
+    def _name_body_end(self, entries, body, cleanup=None):
         """Offset of the last instruction of an ``except ... as name`` body.
 
         The body is the span the table protects between the binding and the
@@ -2078,9 +2540,12 @@ class Rewriter(object):
         instruction -- the rotation that follows it belongs to the exit
         sequence, not to the body.
         """
-        for entry in entries:
-            if entry.start == body.offset and entry.lasti:
-                return self._last_offset_before(entry.end)
+        spans = [entry for entry in entries if entry.lasti
+                 and body.offset <= entry.start < (cleanup or body.offset + 1)
+                 and self.raw[self._offset_index(entry.start)].opname != 'COPY'
+                 and (entry.target == cleanup if cleanup is not None else entry.start == body.offset)]
+        if spans:
+            return self._last_offset_before(max(entry.end for entry in spans))
         return None
 
     def _last_offset_before(self, end):
@@ -2155,6 +2620,11 @@ class Rewriter(object):
         for index, raw in enumerate(self.raw):
             opname = raw.opname
             if index < lifted_until:
+                continue
+            if opname == 'SEND':
+                lifted_until = self._skip_send_loop(index)
+                for position in range(len(pending_depths)):
+                    pending_depths[position] -= 1
                 continue
             spec = self.comprehensions.get(raw.offset)
             if spec is not None:
@@ -2254,6 +2724,7 @@ class Rewriter(object):
         return False
 
     def run(self):
+        self._allocated_offsets = {raw.offset for raw in self.raw}
         code = self.code
         shape = self.analyse()
         runs = self._store_runs()
@@ -2284,7 +2755,25 @@ class Rewriter(object):
                         k += 1
             index = self._translate_step(index, out, runs, shape, close_merges)
         self._resolve_handler_targets(out)
+        self._retarget_stray_jumps(out)
+        if tails:
+            out = Decompiler310()._renumber_stream(out)
         return out
+
+    def _retarget_stray_jumps(self, instructions):
+        """Resolve dropped padding targets without moving surviving instructions."""
+        from bisect import bisect_right
+        offsets = sorted({ins.offset for ins in instructions})
+        for ins in instructions:
+            if not (ins.opname.startswith(('JUMP', 'POP_JUMP'))
+                    or ins.opname in ('FOR_ITER', 'SETUP_FINALLY', 'SETUP_EXCEPT')):
+                continue
+            if not isinstance(ins.argval, int) or ins.argval in offsets:
+                continue
+            index = bisect_right(offsets, ins.argval)
+            if index < len(offsets):
+                ins.argval = offsets[index]
+                ins.argrepr = _repr_of(ins.opname, ins.arg, ins.argval)
 
     def _resolve_handler_targets(self, instructions):
         """Point a setup at the first surviving instruction of its handler.
@@ -2340,11 +2829,12 @@ class Rewriter(object):
         (the tail re-emission), not when it is reached in place.
         """
         raw = self.raw[index]
-        close_after = raw.offset in self.try_closes
-        before = len(out)
         result = self._translate_instruction(
             index, out, runs, shape, close_merges, ignore_drops)
-        if close_after and len(out) > before:
+        closes = list({self.raw[step].offset: step
+                       for step in range(index, min(result, len(self.raw)))
+                       if self.raw[step].offset in self.try_closes}.values())
+        if closes and (raw.offset not in getattr(self, '_tail_offsets', ()) or ignore_drops):
             # 3.9 closed the block straight after the last instruction of the
             # protected region.  The inline ``else``/``finally`` clause 3.11
             # kept in front of the handler follows right after it, and the
@@ -2352,9 +2842,28 @@ class Rewriter(object):
             # The close is emitted here rather than inside the translation of
             # the instruction, because several opcodes are translated by a
             # branch of their own that never reaches the common tail.
-            out.append(self._make(raw, 'POP_BLOCK', None, None, line_no=None,
-                                  offset=self._close_offset(index)))
+            for step in closes:
+                anchor = self.raw[step]
+                close = self._make(anchor, 'POP_BLOCK', None, None, line_no=None,
+                                   offset=self._close_offset(step),
+                                   block_id=self._close_owner.get(anchor.offset))
+                close.is_jump_target = close.offset in self.jump_targets
+                out.append(close)
+                for owner in self._extra_close_owners.get(anchor.offset, ()):
+                    out.append(self._make(anchor, 'POP_BLOCK', None, None, line_no=None,
+                                          offset=self._fresh_offset(close.offset), block_id=owner))
         return result
+
+    def _fresh_offset(self, start):
+        """Allocate a synthetic address once, without collisions."""
+        live = getattr(self, '_allocated_offsets', None)
+        if live is None:
+            live = self._allocated_offsets = {raw.offset for raw in self.raw}
+        offset = start + 1
+        while offset in live:
+            offset += 1
+        live.add(offset)
+        return offset
 
     def _close_offset(self, index):
         """Address the synthesised ``POP_BLOCK`` at *index* should claim.
@@ -2367,6 +2876,12 @@ class Rewriter(object):
         raw_list = self.raw
         if index + 1 < len(raw_list):
             nxt = raw_list[index + 1]
+            if nxt.offset in getattr(self, '_tail_offsets', ()) and nxt.opname not in _SILENT:
+                return self._fresh_offset(raw_list[index].offset)
+            if nxt.offset in self._exception_targets:
+                return self._fresh_offset(raw_list[index].offset)
+            if nxt.offset > raw_list[index].offset:
+                return nxt.offset
             if nxt.offset in self._drops or nxt.opname in _SILENT:
                 return nxt.offset
         return raw_list[index].offset
@@ -2384,12 +2899,12 @@ class Rewriter(object):
         empty = getattr(self, 'empty_body_setups', set())
         for target in targets:
             out.append(self._make(raw, 'SETUP_FINALLY', raw.offset, target,
-                                  line_no=None))
+                                  line_no=None, block_id=target))
             if (raw.offset, target) in empty:
                 # The inner ``try`` body is empty, so 3.9 closed it with a
                 # ``POP_BLOCK`` right after the ``SETUP_FINALLY``.
                 out.append(self._make(raw, 'POP_BLOCK', None, None,
-                                      line_no=None))
+                                      line_no=None, block_id=target))
 
     def _translate_instruction(self, index, out, runs, shape, close_merges,
                                ignore_drops=frozenset()):
@@ -2398,6 +2913,16 @@ class Rewriter(object):
         raw_list = self.raw
         raw = raw_list[index]
         opname = raw.opname
+        for slot, owner in enumerate(getattr(self, '_pre_closes', {}).get(raw.offset, ())):
+            pop = self._make(raw, 'POP_BLOCK', None, None, line_no=None, block_id=owner)
+            if slot:
+                pop.offset = self._fresh_offset(raw.offset)
+            out.append(pop)
+        if raw.offset not in getattr(self, '_tail_offsets', ()) or ignore_drops:
+            self._emit_block_setups(raw, out)
+        if raw.offset in getattr(self, '_with_handler_markers', ()):
+            out.append(self._make(raw, 'WITH_EXCEPT_START', None, None, block_id=raw.offset))
+            return index + 1
         loop_exit = self._loop_breaks.get(raw.offset)
         if loop_exit is not None:
             out.append(self._make(raw, 'JUMP_ABSOLUTE', loop_exit, loop_exit,
@@ -2428,7 +2953,6 @@ class Rewriter(object):
             # clause body, so the outer ``SETUP_FINALLY`` sits on the inner
             # chain's head.  Taking the replacement alone reads the whole nest
             # as the flat clause list of one ``try``.
-            self._emit_block_setups(raw, out)
             out.extend(self._make(raw, op, a, v)
                        for op, a, v in self.try_replace[raw.offset])
             return index + 1
@@ -2504,7 +3028,6 @@ class Rewriter(object):
                 raw.arg >> 2, raw.argval,
             ))
             return index + 1
-        self._emit_block_setups(raw, out)
         if raw.offset in self.with_closes:
             # 3.9 closed the ``with`` block right before the implicit
             # ``__exit__`` call, so the close goes in front of the operands the
@@ -2662,6 +3185,9 @@ class Rewriter(object):
         the result and must survive, so ``POP_TOP`` is not part of it.
         """
         raw_list = self.raw
+        target = self._offset_index(raw_list[index].argval)
+        if target is not None and target > index:
+            return target
         cursor = index
         total = len(raw_list)
         while cursor < total:
@@ -2709,10 +3235,22 @@ class Rewriter(object):
         return runs
 
     def _make(self, raw, opname, arg, argval, line_no=None,
-              synthetic_loop_exit=False, offset=None):
+              synthetic_loop_exit=False, offset=None, block_id=None):
         """Build one 3.9 :class:`Instruction` standing in for *raw*."""
+        if opname == 'GET_ANEXT':
+            for entry in _exception_entries(self.code):
+                if entry.start <= raw.offset < entry.end:
+                    index = self._offset_index(entry.target)
+                    if index is not None and self.raw[index].opname == 'END_ASYNC_FOR':
+                        argval = entry.target
+                        break
         if line_no is None:
-            line_no = raw.starts_line
+            line_no = _line_of(raw) if isinstance(raw.starts_line, bool) else raw.starts_line
+        if block_id is None:
+            if opname in ('SETUP_FINALLY', 'SETUP_EXCEPT', 'SETUP_WITH', 'SETUP_ASYNC_WITH'):
+                block_id = argval
+            elif opname == 'POP_BLOCK':
+                block_id = getattr(self, '_with_close_owner', {}).get(raw.offset)
         if offset is None:
             offset = raw.offset
         return Instruction(
@@ -2725,6 +3263,9 @@ class Rewriter(object):
             line_no=line_no,
             is_jump_target=offset in self.jump_targets,
             synthetic_loop_exit=synthetic_loop_exit,
+            block_id=block_id,
+            positions=getattr(raw, 'positions', None),
+            protected_by=getattr(self, '_protected_by', {}).get(raw.offset),
         )
 
 
@@ -2817,6 +3358,17 @@ class Decompiler311(Decompiler310):
         if handler_start_idx <= try_end_idx or handler_start_idx >= len(instructions):
             return [], None
 
+        handler_end = self._handler_end(instructions, handler_start_idx)
+        if handler_end > handler_start_idx and instructions[handler_end - 1].opname == 'RETURN_VALUE':
+            previous = self._keep_clause_returns
+            self._keep_clause_returns = True
+            try:
+                body = self._emit_statements(code, instructions, start=handler_start_idx, end=handler_end)
+            finally:
+                self._keep_clause_returns = previous
+            self._handled_ranges.append((handler_start_idx, handler_end))
+            return body, handler_end
+
         if try_end_idx + 1 == handler_start_idx:
             # Nothing was pasted between the block pop and the handler: every
             # path that leaves this ``try`` runs the clause and escapes -- a
@@ -2832,16 +3384,28 @@ class Decompiler311(Decompiler310):
 
         # 3.9 uses a jump to close the inline copy; 3.11/3.12 don't always
         if start < len(instructions) and instructions[start].opname in ("JUMP_FORWARD", "JUMP_ABSOLUTE"):
-            # Inline copy closed with jump; resume after the handler
-            end = start
-            # Mark the handler copy as handled
-            handler_end = self._handler_end(instructions, handler_start_idx)
-            self._handled_ranges.append((handler_start_idx, handler_end))
-            return [], handler_end
+            landing = self._find_target_idx(instructions, self._jump_target(instructions[start]))
+            if start < landing < handler_start_idx:
+                start = landing
+            else:
+                body, _ = super()._collect_finally_body(
+                    code, instructions, handler_start_idx - 1, handler_start_idx)
+                return body, start
 
-        # Collect the inline finally clause
-        length = self._finally_clause_length(instructions, handler_start_idx)
-        end = min(handler_start_idx, start + length)
+        h0 = handler_start_idx
+        while h0 < len(instructions) and instructions[h0].opname in self._BLOCK_NOISE:
+            h0 += 1
+        end, clause_ran_out = self._inline_clause_end(instructions, start, h0)
+        if end <= start:
+            if instructions[handler_start_idx].opname == 'RERAISE':
+                handler_end = self._handler_end(instructions, handler_start_idx)
+                self._handled_ranges.append((handler_start_idx, handler_end))
+                return [], start
+            return super()._collect_finally_body(
+                code, instructions, handler_start_idx - 1, handler_start_idx)
+        if not clause_ran_out:
+            end -= self._inline_copy_back_edge(instructions, start, end, h0)
+        length = end - start
 
         if length or instructions[start].opname != "RETURN_VALUE":
             resume = end
@@ -2856,15 +3420,13 @@ class Decompiler311(Decompiler310):
         if end <= start:
             return [], resume
 
-        body = self._emit_statements(
-            code, instructions, is_module=False, start=start, end=end,
-            out_stack=[],
-        )
-        # Strip trailing pass/raise/return None that belong to the clause setup
-        while body and (
-            isinstance(body[-1], (ast.Pass, ast.Raise)) or _is_bare_return(body[-1])
-        ):
-            body.pop()
+        previous = self._reading_inline_finally
+        self._reading_inline_finally = True
+        try:
+            body = self._emit_statements(
+                code, instructions, is_module=False, start=start, end=end, out_stack=[])
+        finally:
+            self._reading_inline_finally = previous
         return body, resume
 
     def _try_body_end(

@@ -1,8 +1,57 @@
 # 项目缺陷清单（bugs.md）
 
-> 最后更新：2026-11-06。状态含义：
+> 最后更新：2026-11-07。状态含义：
 > **已修复** / **部分修复** / **未修复** / **不适用**。
 > 复现与验证命令见文末。
+
+---
+
+## 2026-11-07 Python 3.11 / 3.12 / 3.13 控制流恢复（AE）
+
+**状态：本轮目标缺陷已修复。** 下文保留历史排查记录；涉及这三个后端的
+`boom.py`、D2/D3/D4 和异常区域边界，以本节验证结果为准。
+
+修复在各自独立后端落地，没有整组替换为 3.14 实现，也没有修改其他版本的后端。
+
+- 原始异常表目标作为 `Instruction.block_id`，原始保护范围作为
+  `protected_by` 保留。共享 close 按 owner 配对、从内向外关闭，分组翻译和
+  3.13 合并指令不再漏发或重复发 close；handler 地址不被合成 pop 占用。
+- `with` / `async with` 只保留各自的 handler 标记；正常收尾、异常抑制路径、
+  多上下文管理器和共享循环 latch 分开处理。保护范围的可达性从对应体入口计算，
+  兼容位于 `except*` handler 内的上下文管理器。
+- 异常 handler 沿实际后继查找回边，不在首个 `RERAISE` 处截断，也不扫描进
+  后续独立 handler。循环内复制或共享的返回尾重新恢复成 break；独立尾部搬移后
+  重编号，正常跳转不再误恢复成 `while True`。
+- finally 副本比较操作数，并结合原始保护范围隐藏退出路径副本。返回表达式仍在
+  try / with 体内求值；finally 的显式 raise、return None、return 表达式不再被
+  当作编译器收尾删除。内联 finally 不吸收外层尚未完成的 return。
+- 恢复带 `EXTENDED_ARG` 的 while 条件、for/while else、嵌套 async for/else，
+  区分 continue、break、return 和自然回边。`SEND` 的结束使用实际目标，
+  `CLEANUP_THROW` 不再删除后续源级退出语句。
+- `except ... as ...` 清理、属性/元组异常类型、嵌套 handler 边界及裸 raise
+  保持正确；`except*` 恢复为 `ast.TryStar`，保留子组匹配、重组和异常链语义。
+- 3.13 的布尔 `starts_line` 不再作为行号使用；补偿 iterable / 常量 return 的
+  位置编码差异，同时保留现有 3.13 闭包、class 和循环 teardown 兼容处理。
+
+回归：`tests/control_flow_cases.py` 包含 **81 组组合**（含 36 组 loop × exit ×
+wrapper 矩阵），每组 **12 种输入**，在三个版本各自编译并对照返回值、事件顺序、
+异常成员和 cause/context，合计 **2,916 组行为对照**。此外检查异常区域 owner、
+边界、重写可重复性、生成器 close/throw、异步生成器 aclose/athrow，以及原始
+`boom.py` 的 AST 一致性。新门禁已接入 `tests/run.py`，保持旧计数不变。
+
+验证命令：
+
+```powershell
+.\embed_python\python-3.11\python.exe tests\test_modern_control_flow.py
+.\embed_python\python-3.12\python.exe tests\test_modern_control_flow.py
+.\embed_python\python-3.13\python.exe tests\test_modern_control_flow.py
+.\embed_python\python-3.11\python.exe tests\test_cfg.py OutputNormalizationTests Rewriter311Tests
+.\embed_python\python-3.12\python.exe tests\run.py
+```
+
+原门禁基线 **261/263、77/77**；本轮收尾 **263/263、77/77**，组合控制流
+专项 **18/18**。原有 SOURCE FIDELITY 中 `prime` 的字面量结构差异及 3.9 的
+语法展示差异仍作为独立项目报告，不等同于本轮控制流行为失败。
 
 ---
 

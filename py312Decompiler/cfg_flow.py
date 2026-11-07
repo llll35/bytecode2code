@@ -32,13 +32,13 @@ from typing import Dict, FrozenSet, List, Optional, Sequence, Set, Tuple
 _UNCONDITIONAL = frozenset((
     "JUMP_ABSOLUTE", "JUMP_FORWARD", "JUMP", "RERAISE", "RETURN_VALUE",
     "RETURN_CONST", "RAISE_VARARGS", "END_FINALLY", "BREAK_LOOP",
-    "CONTINUE_LOOP", "RETURN_GENERATOR", "YIELD_VALUE",
+    "CONTINUE_LOOP", "RETURN_GENERATOR",
 ))
 
 #: Opcodes that push a block whose handler is named in the operand.
 _SETUP_OPS = frozenset((
     "SETUP_FINALLY", "SETUP_EXCEPT", "SETUP_ASYNC", "SETUP_WITH",
-    "BEFORE_WITH",
+    "BEFORE_WITH", "SETUP_ASYNC_WITH",
 ))
 
 #: Opcodes that end a protected region on the normal path.
@@ -48,7 +48,7 @@ _BLOCK_POPS = frozenset(("POP_BLOCK",))
 _CONDITIONAL_JUMPS = frozenset((
     "POP_JUMP_IF_FALSE", "POP_JUMP_IF_TRUE", "POP_JUMP_IF_NONE",
     "POP_JUMP_IF_NOT_NONE", "JUMP_IF_FALSE_OR_POP", "JUMP_IF_TRUE_OR_POP",
-    "JUMP_IF_NOT_EXC_MATCH",
+    "JUMP_IF_NOT_EXC_MATCH", "JUMP_IF_NOT_EG_MATCH",
 ))
 
 _LOOP_HEADS = frozenset(("FOR_ITER",))
@@ -363,15 +363,20 @@ def classify_handler(instructions, entry: int, setup_op: str = "") -> str:
     ``with`` region is named by its own setup opcode.  Anything else runs
     unconditionally on exit, which is ``finally``.
     """
-    if setup_op in ("SETUP_WITH", "SETUP_ASYNC", "BEFORE_WITH"):
+    if setup_op in ("SETUP_WITH", "SETUP_ASYNC", "SETUP_ASYNC_WITH", "BEFORE_WITH"):
         return KIND_WITH
     window = [instr.opname for instr in instructions[entry:entry + 8]]
     if not window:
         return KIND_FINALLY
     if window[:3] == ["POP_TOP", "POP_TOP", "POP_TOP"]:
         return KIND_EXCEPT
-    if window[0] == "DUP_TOP" and "JUMP_IF_NOT_EXC_MATCH" in window[:4]:
-        return KIND_EXCEPT
+    if window[0] == "DUP_TOP":
+        for instr in instructions[entry + 1:]:
+            if instr.opname in ("JUMP_IF_NOT_EXC_MATCH", "JUMP_IF_NOT_EG_MATCH"):
+                return KIND_EXCEPT
+            if instr.opname not in ("LOAD_GLOBAL", "LOAD_NAME", "LOAD_FAST",
+                                    "LOAD_DEREF", "LOAD_ATTR", "BUILD_TUPLE", "EXTENDED_ARG"):
+                break
     if (window[0] == "LOAD_CONST" and instructions[entry].argval is None
             and len(window) > 3
             and window[1] in ("STORE_FAST", "STORE_NAME", "STORE_DEREF")
@@ -467,8 +472,16 @@ class ExceptionAnalyzer:
                         # is this region that is running, however it was reached.
                         stack = stack + ((index, False),)
                 elif name in _BLOCK_POPS and stack:
-                    setup, tainted = stack[-1]
-                    stack = stack[:-1]
+                    owner = getattr(self.instructions[index], "block_id", None)
+                    slot = len(stack) - 1
+                    if owner is not None:
+                        slot = next((k for k in range(len(stack) - 1, -1, -1)
+                                     if getattr(self.instructions[stack[k][0]],
+                                                "block_id", None) == owner), -1)
+                        if slot < 0:
+                            continue
+                    setup, tainted = stack[slot]
+                    stack = stack[:slot] + stack[slot + 1:]
                     region = regions.get(setup)
                     if region is not None:
                         (unwound if tainted else closes).setdefault(
@@ -493,9 +506,12 @@ class ExceptionAnalyzer:
             # it ends.
             region.body_pops = sorted(own or extra)
             region.exit_pops = sorted(extra) if own else []
-            if region.body_end is None:
-                region.body_end = self._body_by_reachability(
-                    region.setup_index, entries)
+            # Simulation visits exceptional successors too; whichever pop is
+            # visited first is not necessarily the normal body's boundary.
+            region.body_end = max(own) if own else self._body_by_reachability(
+                region.setup_index, entries)
+            if region.body_end is None and extra:
+                region.body_end = max(extra)
         return [regions[position] for position in sorted(regions)]
 
     def _body_by_reachability(self, setup: int, entries: Set[int]) -> Optional[int]:
@@ -511,17 +527,21 @@ class ExceptionAnalyzer:
         seen: Set[int] = set()
         stack = [block.number]
         indices: List[int] = []
+        owner = getattr(self.instructions[setup], 'block_id', None)
         while stack:
             number = stack.pop()
             if number in seen:
                 continue
             seen.add(number)
             current = self.cfg.blocks[number]
+            closed_here = False
             for index in range(current.start, current.end):
-                if _opname(self.instructions, index) in _BLOCK_POPS:
+                if (_opname(self.instructions, index) in _BLOCK_POPS
+                        and (owner is None or getattr(self.instructions[index], 'block_id', None) == owner)):
+                    closed_here = True
                     break
                 indices.append(index)
-            if _opname(self.instructions, current.end - 1) in _BLOCK_POPS:
+            if closed_here:
                 continue
             for succ in current.successors:
                 if self.cfg.blocks[succ].start in entries:
