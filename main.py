@@ -99,7 +99,11 @@ def _cmd_decompile(args):
     if not target or not os.path.isfile(target):
         print("usage: decompile <file.pyc>")
         return 2
-    parsed = importlib.import_module("py39Decompiler.pyc_parser").PyCParser.parse_file(target)
+    # ``main()`` has already routed a version-mismatched payload to the
+    # interpreter that wrote it, so parsing here is in-version by construction.
+    version = version_of(target) or "3.9"
+    parser_folder = "py%sDecompiler.pyc_parser" % version.replace(".", "")
+    parsed = importlib.import_module(parser_folder).PyCParser.parse_file(target)
     folder = "py%sDecompiler" % parsed.python_version.replace(".", "")
     if not os.path.isdir(folder):
         print("no decompiler folder for %s" % parsed.python_version)
@@ -139,6 +143,7 @@ def _cmd_compile(args):
     interpreter = os.path.join(_ROOT, "embed_python", "python-" + ver, "python.exe")
     if not os.path.isfile(interpreter):
         print("interpreter for %s not found" % ver)
+        print("  download it: python prepare.py  (or set PYTHON_ARCH=win32)")
         return 1
     subprocess.run([interpreter, "-c", "import py_compile,sys; py_compile.compile(sys.argv[1], cfile=sys.argv[2], doraise=True)", source_path, out_path], check=True)
     print("compiled %s -> %s (python %s)" % (source_path, out_path, ver))
@@ -210,6 +215,30 @@ def _cmd_code_info(args):
 # dispatcher mapping
 # ------------------------------------------------------------------
 
+#: Commands that read a ``.pyc`` through ``marshal``.  ``marshal`` has no
+#: cross-version compatibility, so the payload can only be parsed by the Python
+#: that wrote it.  When the running interpreter is a different version, the
+#: command is re-run under the matching embedded interpreter.
+_PYC_COMMANDS = frozenset((
+    "decompile", "d", "dis", "disassemble", "ir", "code-info", "infos",
+    "header", "skeleton",
+))
+
+
+def _current_version():
+    return "%d.%d" % sys.version_info[:2]
+
+
+def _rerun_in_interpreter(version, argv):
+    """Re-run ``main.py`` with *argv* under the embedded interpreter for *version*."""
+    interpreter = os.path.join(_ROOT, "embed_python", "python-" + version, "python.exe")
+    if not os.path.isfile(interpreter):
+        print("no embedded interpreter for Python %s (running %s)"
+              % (version, _current_version()))
+        print("  download it: python prepare.py")
+        return 1
+    return subprocess.run([interpreter, os.path.join(_ROOT, "main.py")] + argv).returncode
+
 ALIASES = {
     "d": "decompile",
     "dis": "dis",
@@ -259,6 +288,13 @@ def main(argv=None):
     if cmd not in COMMANDS:
         print("unknown command:", cmd)
         return 2
+    # A ``.pyc`` can only be unmarshalled by the Python that wrote it, so hand a
+    # version-mismatched payload to that interpreter rather than failing here.
+    if cmd in _PYC_COMMANDS and rest and os.path.isfile(rest[0]):
+        from tests.equivalence import version_of
+        file_version = version_of(rest[0])
+        if file_version and file_version != _current_version():
+            return _rerun_in_interpreter(file_version, args)
     return COMMANDS[cmd](rest)
 
 

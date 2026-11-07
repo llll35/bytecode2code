@@ -1,8 +1,150 @@
 # 项目缺陷清单（bugs.md）
 
-> 最后更新：2026-11-01。状态含义：
+> 最后更新：2026-11-06。状态含义：
 > **已修复** / **部分修复** / **未修复** / **不适用**。
 > 复现与验证命令见文末。
+
+---
+
+## 2026-11-06 boom.py 3.12/3.13 with 收尾被误判 break（AD）
+
+3.12/3.13 的 `with` 体塌成 `continue`、try 跑到循环外，根因在
+`Rewriter._analyse_exception_loop_exits`：凡异常表 `entry.end` 落在 NOP 上就注册
+`_loop_breaks[NOP]=下一指令`。内层 `with` 的正常路径收尾锚点（3.12 offset 422、
+3.13 offset 436）正是这样一个 NOP，被当成循环 break。`_translate_instruction`
+的 `loop_exit` 分支先于 `with_closes` 的 POP_BLOCK 发射并提前返回，发出合成
+`JUMP_ABSOLUTE` 而非 POP_BLOCK；缺了收尾，`ExceptionAnalyzer` 把外层 with 的
+pop（读端 index 87）记成 index 21 处 try/finally 的 body pop，try 体结束点与
+with 体结束点重合，try 遂被组装到循环外。3.14 的同位 NOP 发的是 POP_BLOCK
+（其 `_loop_breaks` 对 boom 为空），故 3.14 正常。
+
+修正：注册前加守卫 `raw_list[end].offset not in self.with_closes`——with 收尾
+锚点是块自身的正常路径结束，不是 break。`with_closes` 在该方法之前已算好。
+
+3.12/3.13：boom 65→53 行，门禁 49/49、48/48。剩余 53 行是内层
+try/except/finally（攻击点 3–5）：`except … continue` 读成 break、嵌套 finally
+读成 pass、handler 副本泄漏到循环外。源于 try 区域收尾 NOP 上其余的合成
+`_loop_breaks`（如 3.12 306→310）发出 3.14 没有的冗余 fall-through 跳转，
+`_collect_finally_body` 见 POP_BLOCK 后紧跟跳转即返回空子句。试过更广守卫
+（清空全部 loop_breaks→58；正常回边守卫→55 且回退 no_multi_with/
+with_plus_nested_finally；跟随跳转→58）均非门禁安全收益，故只保留已验证的
+with_closes 守卫。彻底解决需把 `_analyse_exception_loop_exits` 重构到 3.14
+的成熟逻辑（含 has_normal_back_edge 守卫），风险较高，留待后续。
+
+脚本：子任务诊断脚本在 `_scratch/`；本轮验证 `_scratch/port_back_edge_guard.py`
+（试后回滚）、`_scratch/follow_jump.py`（试后无效）。
+
+---
+
+## 2026-11-06 boom.py 3.11 多 with 出栈点（AC）
+
+3.11 的 `with open("x") as f1, open("y") as f2:` 之前塌成单个 `with`：外层
+`with` 的 `POP_BLOCK` 被 `_analyse_with` 锚到 1642（handler 尾部的展开副本），
+而非体自身的 294。`_analyse_with` 取「最后一个可达、且落在 `__exit__` 调用前的
+区域」作体收尾；嵌套 `with` 的 handler 在展开时也跑外层管理器的 `__exit__`，
+异常表把那段也记到外层 handler 名下。原有过滤只排除「覆盖另一 handler 目标」的
+区域，但这段展开区域**起点在嵌套 handler 之后**却仍可达（嵌套 handler 的正常
+出口跳到它），于是 `max` 选中了它。
+
+修正：再加一条排除——起点 ≥ 另一 `with` handler 头部的区域是展开尾部，不是体。
+外层候选遂回到 {192, 294}，取 294；内层不变（272）。多 with 结构恢复。
+
+3.11：boom 36→33 行，门禁 48/48；`no_deep_finally` 31→17、`no_continue`
+35→31、`no_except_as` 35→32。剩余差异是 with 体内 try/except/finally 的体边界
+被 `_exception_regions` 过度记账（把 with 的 POP_BLOCK 记成 try 的 body_pop），
+与 3.12/3.13 同族，属读端图 walk 的核心难题，本轮未动。
+
+仅改 py311（3.14/3.15 已 IDENTICAL，不冒险；3.12/3.13 由并行任务处理）。
+脚本：`_scratch/port_with_unwind_range_311.py`。
+
+---
+
+## 2026-11-06 boom.py 收尾 3.14/3.15（AA/AB）
+
+血缘修正之后，3.14/3.15 剩 15 行，是两个独立缺陷，本轮各修一个，现已**逐字一致**。
+
+**AA — `with` 重复尾隐藏吞掉循环 else/结尾代码**（`decomp_compat.Decompiler310._process_with`）：
+3.10 布局会把「块之后的直线代码」复制一份放在嵌套退出调用之后，读端用
+`_handled_ranges.append((tail_end, handler_start))` 把这份副本标成已消费。但当
+`with` 是循环体最后一条语句时根本没有这份副本——正常路径经循环回边离开，
+`tail_end` 到 handler 之间是循环的 `else` 子句和循环之后的语句，全是真实源码，
+被一并隐藏后整段丢失（`FOR_ITER` 退出目标在改写流里无对应指令，读端从
+139..227 恢复后跳过 else）。修正：新增 `_with_tail_is_back_edge`，当
+`instructions[tail_end]` 是指向 `with` setup 之前的无条件跳转（外层循环回边）
+时跳过这次隐藏。3.14/3.15：15→7 行。
+
+**AB — `except … as e` 体内的 `continue` 读成 `break`**（`decompiler._classify_jump`）：
+3.11+ 把带 `finally`/`except as` 的 `continue` 编译成先跳到该退出路径上的子句副本
+（如 762→934 的 `result.append('mid')`），副本末尾再跳回循环头（1002→28）。
+`_match_loop_jump` 只看第一跳，934≥循环退出点就判 `break`。修正：新增
+`_continue_through_unwind`，当直接匹配为 break 且是无条件跳转时，沿落点直线 run
+走到它自己的无条件跳转——若指回最内层循环头则为 `continue`；真正的 break 落在
+循环之后的代码，其下一个跳转不会回到本循环头，re-raise/return 则视为逃逸。
+3.14/3.15：7→**0（IDENTICAL）**。
+
+两项都按锚点移植到 3.11–3.15 五个后端，逐组门禁全绿（3.11 48/48、3.12 49/49、
+3.13 48/48、3.14 48/48、3.15 48/48），ROUND-TRIP 263/263、CONTROL FLOW 77/77、
+selftest 2/2。3.11/3.12/3.13 的 boom 差异属另一族（`with` 体截断 / finally 子句
+配对），这两项对它们无副作用但也未消除其主缺陷。
+
+| 版本 | 本轮前 | 本轮后 |
+|------|--------|--------|
+| 3.11 | 36 | 36 |
+| 3.12 | 65 | 65 |
+| 3.13 | 65 | 65 |
+| 3.14 | 15 | **IDENTICAL** |
+| 3.15 | 15 | **IDENTICAL** |
+
+脚本：`_scratch/port_with_guard.py`、`_scratch/port_chain_continue.py`、
+诊断 `_scratch/who_marks.py`（定位超大 handled range 的来源）。
+
+---
+
+## 2026-11-06 boom.py 血缘修正（Y/Z）
+
+**根因**：`Rewriter._region_start` 把 `finally` 块的 SETUP 起点向前提升时，只要求
+两段区域的 `depth` 相等、且候选 handler 地址落在 `[begins, target)` 区间内。
+这两条都不是嵌套关系：同一条语句里前后相继的两个块深度相同，两个互不相干的
+`try` 语句的 handler 也会偶然满足地址顺序。于是外层 `finally` 的块被开到了
+上一个 `try` 的体内，读端把 `except` 的 `continue` 读成 `break`，并把
+`for/else` 与结尾的 `try/finally` 整段吞掉。
+
+**修正**：提升前再用异常表本身验证一次血缘——从候选 handler 出发，沿着
+"保护该 handler 的那些区域"的 cleanup target 走，走到待提升的目标才算数。
+带 `seen` 集合防环。相邻拼接（`entry.end == begins`）那条规则不变。
+
+| 版本 | 修正前 | 修正后 |
+|------|--------|--------|
+| 3.11 | 36 | 36（本样本无提升，行为不变；与 3.12–3.15 对齐） |
+| 3.12 | 80 | **65** |
+| 3.13 | 80 | **65** |
+| 3.14 | 42 | **15** |
+| 3.15 | 42 | **15** |
+
+门禁七组全绿：**340/340**（`embed_python/python-X.Y/python.exe tests/run.py`
+逐组跑，ROUND-TRIP 与 CONTROL FLOW 合并计数），3.9/3.10 的 `boom.py` 仍逐字一致。
+
+**试过但回退的方向（3.11）**：把 `finally` 块的 `POP_BLOCK` 挪到内联子句头部
+那个填充槽位（3.9 正是写在那里）。子样本上收益很大——`only_with_try`
+16→5、`no_multi_with` 45→31、`only_nested_finally` 28→ok——但在 `boom.py`
+整体上不能与 `flow_nested_finally_reraise` 同时成立：
+
+- 只在头部补一次出栈：`boom.py` 23 行，`flow_nested_finally_reraise` 门禁回退
+  （FOR_ITER 目标 62 vs 51，外层 `finally` 常量丢失）。
+- 头部出栈 + 同时删除该区域原有的锚点出栈：门禁 48/48，`boom.py` 反升到 37 行。
+- 再放宽 `_close_offset`（分支指向的下一个地址也算出栈地址）：仍 47/48。
+
+结论：3.9 的 `finally` 出栈点数是"每块一次"，而 3.11+ 的正常路径**根本不弹出**
+该块——把出栈补回头部会连带改变 `_exc_stack` 的配对，读端在
+`nested_finally_reraise` 那种"handler 里还有嵌套 try"的形状上失去正确配对。
+这一族需要的是读端按块归属重新配对，而不是在 Rewriter 里补 POP_BLOCK。
+相关脚本：`_scratch/port_clause_head_pop2.py`、`_scratch/close_combos.py`、
+`_scratch/revert_clause_head.py`（3.12–3.15 未采纳该实验，残差为 0）。
+
+**3.14/3.15 剩下的 15 行**是两个独立缺陷：`except … as e` 体内的 `continue`
+被读成 `break`；`for … else` 与结尾 `try/finally` 整段丢失（`FOR_ITER`
+的退出目标 512 在改写流里没有对应指令，读端从 139..227 恢复后就跳过了 else
+子句）。3.12/3.13 的 65 行以同一族 `with` 体截断为主。
 
 ---
 
@@ -14,8 +156,10 @@
 | `tests/run.py` 的 CONTROL FLOW | **77/77**（七版本各 11/11） |
 | `python main.py selftest` | **2/2** 通过 |
 | `embed_python/python-3.12/python.exe tests/test_cfg.py` | 8 项失败，与 HEAD 逐字一致（既有，非本轮回退） |
+| `boom.py` 按 AST 复测 | 3.9、3.10 逐字一致；3.11–3.15 仍 DIFF，剩余形状见「2026-11-04 boom.py 复测（Q/R/S/T）」与「2026-11-04 boom.py 修复 3.10（U/V/W/X）」 |
 
-ROUND-TRIP 全部逐字节一致。自 2026-10-30 的 234/263 起，本轮修复见下节 H/I/J。
+ROUND-TRIP 全部逐字节一致。自 2026-10-30 的 234/263 起，本轮修复见下节 H/I/J，
+其后再补 K/L/M（boom.py 复测一节）。
 
 ---
 
@@ -72,6 +216,191 @@ def f(x):
 3.14/3.15 的 `_analyse_exception_loop_exits` 是**两套不同的算法**（2609 vs 2827
 字符，3.14/3.15 那套还带着 `has_normal_back_edge` 与 `getattr(self, '_loop_breaks',
 {})` 的旧写法），修之前得先把两边对齐，否则一条分支上的修法在另一边不生效。
+
+---
+
+## 2026-11-01 boom.py 复测
+
+压力样本 `boom.py` 只按 AST 与源码逐字一致判定——门禁比的是字节码，覆盖不到它。
+本轮先复测，再把它拆成 8 个最小形状逐版本定位（`_scratch/boom_bisect.py`）。
+
+| 版本 | 复测结果 |
+|------|----------|
+| 3.9 | 上一轮的尾巴重排把它读成 73 行爆炸输出；K 项之后 **AST 与源码逐字一致** |
+| 3.10–3.15 | 仍 DIFF；L/M 取回可取的形状，剩余 4 类见下表 |
+
+剩余失败只有 4 类：`for_else`（源码里的 `for … else` 没有 `break`，与「循环之后的
+语句」在字节码上同形，信息不在流水里）、`break_in_try`（就是上一节的条件 `break`）、
+`deep_finally`（`finally` 里再套 `finally`，3.12 把内层链铺开成 4 份副本）、
+`except_as_nested_finally`（3.11–3.15 塌陷成 `pass` 与重复子句）。
+
+| # | 缺陷 | 影响版本 | 根因 / 修法 |
+|---|------|----------|-------------|
+| K | G 项的尾巴重排在**真** 3.9/3.10 流水上误触发，把 `with` 之后的一段搬进 handler | 3.9 | `_find_stray_block_tail` 把 `SETUP_FINALLY -> 191` 的 target 当成 out-of-line handler，而 3.9 的 target 是**内联**的 `finally` 子句；搬走 `[173,191)` 等于把 `try` 拦腰切断。新增类开关 `HOIST_STRAY_BLOCK_TAILS`：基类 `False`，只有 `Decompiler311` 置 `True`——重排本就是给 `Rewriter` 铺的流水用的 |
+| L | 每个函数顶上凭空多一条 docstring（`"""stop"""`、`"""x"""`） | 3.14、3.15 | 3.14 起 CPython 不再把 `co_consts[0]` 预留成 docstring 槽（旧版本无 docstring 时该槽是 `None`），第一个**被使用**的常量就落在 0；`_prepend_function_docstring` 只看「0 是 str」，于是把正文用到的字面量当 docstring 贴回去。docstring 是正文唯一**不会 LOAD** 的常量，判据改为「正文里有 `LOAD_CONST` 取到它就不贴」。同版本 `ast_sweep` 从 2/9 → 3/9（`feature_matrix.py` 取回） |
+| M | 以 `if` 收尾的函数把隐式返回读成语句（`if` 体里多一条 `return None`） | 3.10 | `_is_epilogue_pair` 原先只认「这对排在流水最末」或「其后已被 `_handled_ranges` 消费」。3.10 给每条分支各写一份尾声，两份连着排在结尾时前一份也是尾声（`if x: return` 与 `if x: pass` 编出同样的字节），新增这条判据后 3.10 的 `if` 形状 AST 一致 |
+
+**M 的 `with` 分支仍未修**：3.9/3.10 里 `with` 的尾声副本后面还跟着
+`WITH_EXCEPT_START` 卸载链，轮到那个 `LOAD_CONST None` 时区间尚未登记，判据拿不到
+「后面全是已消费的 handler」，于是 3.9 在函数层、3.10 在 `with` 体层各多出一条
+`return None`（字节码仍逐字节一致，只有 AST 差）。`def f(): with a: print(1)` 与
+`def f(): with a: print(1); return` 在 3.9/3.10 只差一条 `NOP`，语句级丢弃会打到
+真写了 `return` 的样本，故未动。
+
+K/L/M 之后 ROUND-TRIP **263/263**、CONTROL FLOW **77/77** 不变；`ast_sweep` 在
+3.9/3.10/3.12 与 HEAD 逐项相同（无回退），3.14/3.15 各 +1。
+
+---
+
+## 2026-11-03 boom.py 深挖（N/O/P）
+
+按 AST 复测 `boom.py`，3.11–3.15 输出里到处是 `None(None, None, None)`，3.14/3.15
+更整个函数塌成 `with … : pass` 四行。逐个定位到三处独立缺陷：
+
+| # | 缺陷 | 影响版本 | 根因 / 修法 |
+|---|------|----------|-------------|
+| N | `with` 体内 `break`/`continue` 退出时，管理器的 `__exit__(None, None, None)` 收尾被当成语句读出（满屏 `None(None, None, None)`） | 3.11–3.15 | 3.11+ 编译器把每次异常退出的 `__exit__` 调用**逐份内联**到 break/continue/return 各路径上；`_analyse_with` 只折叠正文末尾自然落出那一份，循环退出的副本漏网。新增 `Rewriter._drop_with_unwind_teardowns`：以异常表为准（该 run 的起点是某个 `with` handler 保护区的起点、且 CALL 不在 `with_exits` 里即非自然收尾），配合「三个 `None` 之前是语句完成量（POP_TOP/NOP/SWAP/COPY/ROT）而非取可调用对象的 LOAD」这条判据，把 `LOAD_CONST None ×3; CALL; POP_TOP` 整段丢进 `_drops`。真写 `foo(None, None, None)` 的调用总在首个实参前压 `foo`，两条判据同时成立才丢，误伤面为零 |
+| O | 嵌套 `with` 的 `SETUP_WITH` 收尾被 CFG 图记到内联 `finally` 的 `POP_BLOCK` 上，`_find_pop_block` 无条件下信它，`with` 体被读短 | 3.14、3.15 | 3.14 的 `with_anchors`/`prefix` 折叠把两个 `SETUP_WITH` 收成**一个** `POP_BLOCK`，共享块栈模拟把嵌套 `finally` 的 pop 记给了外层 `with`（`last_body_pop=88` 早于真实收尾）。在 `_find_pop_block` 的图短路前加判据：`is_with` 时，只有该 pop 之后确实跟着 `__exit__` 收尾（`_with_exit_terminator != -1`）才信它，否则退回向后扫描重取 |
+| P | `if 条件: continue` 嵌在 `for → with → try` 里时，reader 读完 `continue` 就终止整个 `with` 体，3.14/3.15 塌成四行 | 3.14、3.15 | 与 O 同源：3.14 折叠后 `try`（内层 `SETUP_FINALLY`）从图拿到 `last_body_pop=94`，但它被读在 `with` 体 `[20,80)` 内，94 越过了这个 body 的右界，reader 把整段吞掉只剩 `continue`。给 `_find_pop_block` 增 `limit` 形参（`_process_instruction` 里的 body 右界），当 `last_body_pop >= limit` 视为「记到外层块的 pop」、退回把扫描也夹到 `min(try_end_idx, limit)`；扫描的候选循环与两处空返回一并改用 `scan_end` |
+
+三处改完：3.14/3.15 不再塌陷，`with` 体的 `if:continue / if:break / finally` 逐条读回；3.12/3.13 顶部结构（`for → with → try/finally`）也不再是 `None(…)`。**ROUND-TRIP 263/263、CONTROL FLOW 77/77 全绿不变**。
+
+`boom.py` 剩余错处集中在 D3 一族（`except … as e` 清理守卫 + 3 层嵌套 `finally` +
+except 里 `continue`）：`_find_pop_block` 之后仍把 `for … else` 与收尾 `try/finally`
+错并进内层 `else`，且深层还有第二处 `None(…)` 泄漏——这是 reader 异常子句归属的
+老问题，独立于 N/O/P，后续单独处理。3.9/3.10 无 `Rewriter`，N 的修法不适用。
+
+---
+
+## 2026-11-04 boom.py 复测（Q/R/S/T）
+
+先把复测口径校正过来：之前的临时脚本用**宿主**解释器编译样例、再交给别的后端
+读，3.9/3.10 拿到的是 3.13 的字节码，结论自然是假的。现在每个版本都用自己的
+`embed_python/python-<ver>/python.exe` 编译并反编译（`_scratch/bisect_ver.py`、
+`_scratch/boom_status.py`），八个子形状与整份 `boom.py` 都按 AST 逐字比对。
+
+在此基础上定位到四处独立缺陷：
+
+| # | 缺陷 | 影响版本 | 根因 / 修法 |
+|---|------|----------|-------------|
+| Q | 循环体里的内联 `finally` 副本被当成「跑向循环头的尾段」搬出循环 | 3.11–3.15 | `_find_stray_block_tail` 判「这段尾段是不是循环体的一部分」时只看**段内**有没有跳回循环头的指令；可内联 `finally` 的副本是先跳到下一份子句副本、再由那份跳回循环头的，段内看不到那一跳，于是整段被搬走，`try/except/finally` 套在 `for` 里就被读成两份。`_runs_back_to_head` 改为沿控制流往外跟（新增 `_flows_to_head`），段内的跳转落到别处时继续跟下去，直到撞上循环头或落进一条不再回头的路径 |
+| R | 合并点重发的尾巴把「为别的理由删掉的指令」复活 | 3.11–3.15 | `_save_tail_for_merge` 把尾段整段记进 `_drops`，重发时靠 `_tail_offsets` 取消这些删除；但 3.13 在 `END_FOR` 后面写的那个 `POP_TOP` 早就因为别的理由被删过，重发时却被一起取消删除，凭空多出一条 `POP_TOP`。现在只把**本次真的删掉**的偏移记进 `_tail_offsets`，别的理由删的照旧不复活 |
+| S | 跳回 `for` 循环头的指令被当成 `while True` 的回边，循环体在自己内部被重读 | 七版本 | `_handle_plain_jump` 认不出 `continue` 时（循环栈当时是空的）就退化成 `_emit_while_true`，而它不检查回边目标是不是 `FOR_ITER`——于是 `for` 的循环头被当成 `while True` 的头，整个循环体在自身内部又读了一遍，3.12/3.13 上直接 `RecursionError` 崩掉。`_emit_while_true` 的目标若是 `FOR_ITER`/`GET_ITER`，那只能是跳回某个 `for` 循环头（`continue`），不再开第二个循环 |
+| T | `try` 套在 `with` 里时，`continue`/`break` 退出路径上的 `finally` 副本被读成语句 | 3.10–3.15 | 编译器在退出路径上写的是「子句副本 → `with` 的收尾 → 跳回循环头」。`_hide_escape_copies` 认得出副本，但只在副本**紧跟其后**找那条跳转；`with` 的收尾插在中间时就找不到，副本被当成正文语句读出。现在先把收尾这段卸栈跳过，再找跳转 |
+
+Q/R/S/T 落地后：
+
+| 版本 | `boom.py` 按 AST 复测 |
+|------|----------------------|
+| 3.9 | **逐字一致** |
+| 3.10 | **逐字一致**（U/V/W/X 四项修完，见下节） |
+| 3.11 | 38 行差异 |
+| 3.12 | 80 行差异（**不再崩**） |
+| 3.13 | 80 行差异（**不再崩**） |
+| 3.14 | 42 行差异 |
+| 3.15 | 42 行差异 |
+
+子形状复测（`_scratch/bisect_ver.py`）：3.11 的 `except_as_nested_finally` 与
+`for_else_break` 由 Q 取回；3.12–3.15 仍在 `except_as_nested_finally`、
+`break_in_try`、`for_else_break` 上失败。
+
+**ROUND-TRIP 263/263、CONTROL FLOW 77/77 全绿不变。**
+
+仍未解决的三类（独立于 Q/R/S/T）：
+
+* `except_as_nested_finally`（3.12–3.15）：3.13 把 `finally` 子句**内联**在正路
+  上、handler 里另存一份；`_save_tail_for_merge` 认 handler 里那份与正路上那份
+  形状相同，就把正路那份丢了，于是外层 `try` 找不到自己的 `POP_BLOCK`
+  （`try_closes` 里有、但地址落在被丢掉的区间里），`try` 体越界读进 handler。
+* `break_in_try` / `for_else_break`（3.10–3.15）：`break` 被读成 `return`，
+  3.12/3.13 把循环出口的块直接接在 `break` 路径上。
+* `for_else`（全版本）：源码里的 `for … else` 没有 `break` 时与「循环之后的语句」
+  在字节码上同形，信息不在流水里，属于原理上不可判。
+
+---
+
+## 2026-11-04 boom.py 修复 3.10（U/V/W/X）
+
+3.10 剩下 14 行差异，拆开是四处独立缺陷：
+
+| # | 缺陷 | 影响版本 | 根因 / 修法 |
+|---|------|----------|-------------|
+| U | 跳回 `for` 循环头的 `continue` 认不出来 | 3.10 | `dis` 把跳转目标报成地址，而目标那条指令带 `EXTENDED_ARG` 前缀时，报的是**前缀**的地址。前缀被合并掉之后，这个地址再没有指令承载，reader 只能退回「取地址之上的第一条指令」——3.10 的 reader 匹配的是 `for` 循环头的偏移，于是差了两字节，认不出来。3.9 早就把这种目标转发到下一条还活着的指令（`_resolve_extended_targets`），3.10 现在同样处理 |
+| V | `with` 的 `__exit__(None, None, None)` 收尾副本被读成语句 | 3.9、3.10 | `break`/`continue`/`return` 提前退出 `with` 时，编译器在跳转前**另写一份**收尾调用，那份不经过 handler。副本的形状很好认：三个 `None` 是压栈来的，可调用对象是 `DUP_TOP` 复制来的，从不是加载来的。新增 `_hide_teardown_copies` 把这种副本登记为已处理 |
+| W | handler 子句结尾的出口没有被读成出口 | 3.9、3.10–3.15 | handler 正文与子句末尾之间的窗口里装的是编译器自己的卸栈（子句副本、`with` 收尾）加出口，源码级的只有出口。现在把窗口登记为已处理，只发那条跳转。窗口里只有出口一条时，那是子句自然落到循环回边上，不是子句自己的出口，仍旧不读 |
+| X | 出口只在窗口后面还有东西时才算出口 | 3.9、3.10–3.15 | 原判据要求窗口里出口后面还有指令（3.9 在跳转后还写一遍 `e = None; del e`），3.10 不写那一遍，出口就是窗口最后一条，于是 `except … as e:` 末尾的 `continue` 被丢掉。判据改成「窗口里除了出口还有别的东西」（`EXTENDED_ARG` 前缀不算） |
+
+U/V/W/X 落地后：**3.10 的 `boom.py` 按 AST 逐字一致**，3.9 仍逐字一致；
+**ROUND-TRIP 263/263、CONTROL FLOW 77/77 全绿不变**，`prime` 仍是 12 行差异。
+
+W 试过先按「窗口后面还有东西」放宽，3.11 的 `deep_finally` 与
+`except_as_nested_finally` 会回退成错（窗口里那条回边被当成子句的 `continue`），
+故按 X 的判据收紧。3.11–3.15 未套用 W/X 的传递式出口判定（`_leads_to_escape`），
+因为那一版在 3.11 上有回退。
+
+---
+
+## 2026-11-04 boom.py 修 3.11（Y/Z）
+
+3.11 的 `for` 循环整段塌成 `while True:`，内层 `try/except/finally` 丢失，`with`
+的 `__exit__` 收尾副本被读成语句。定位到两处：
+
+| # | 缺陷 | 影响版本 | 根因 / 修法 |
+|---|------|----------|-------------|
+| Y | 跳回 `for` 循环头的 `continue` 认不出来，循环被读成 `while True:` | 3.11–3.15 | 3.11+ 把跳转目标带 `EXTENDED_ARG` 前缀的**前缀地址**留在流水里，而跳转瞄准的正是那个前缀。reader 记的循环头是 `FOR_ITER` 自己的地址，两者对不上；扫「`while True` 回边」时又先撞上前缀，当成了循环头。新增 `_loop_head_offset`：循环头算前缀的地址（3.9/3.10 没有前缀，是空操作） |
+| Z | `with` 的 `__exit__` 收尾副本被读成语句 | 3.11–3.15 | 3.9/3.10 的收尾是 `LOAD_CONST None; DUP_TOP; DUP_TOP; CALL_FUNCTION 3; POP_TOP`（可调用对象复制上栈），3.11+ 是 `LOAD_CONST None` ×3 加 `CALL_FUNCTION 2`（可调用对象已在栈上）。`_is_teardown_copy` 两种写法都认；另外把 `EXTENDED_ARG` 算进卸栈指令集——它只是给后面的指令加宽参数，本身没有意思，跳转前挂着它时扫描会停在它上面，后面的跳转就找不到 |
+
+Y/Z 落地后：3.11 的 `for` 循环读回来了，`with` 收尾副本不再泄漏，
+`with_in_for_try` 在 3.11 上也过了；**3.11 的 `boom.py` 由 38 行差异降到 36 行**，
+**ROUND-TRIP 263/263、CONTROL FLOW 77/77 全绿不变**。
+
+3.11 剩下的 36 行差异是一处根因：**3.11 布局里 `try` 的收尾 `POP_BLOCK` 只出现在
+提前退出的路径上**，正路上没有。3.11 的 `try`/`finally` 不用 3.9 那套块栈，块
+只在异常路径上关；于是一个体内有 `break`/`continue` 的 `try`，正路走完没有收尾，
+而 `_exception_regions` 找到的是 `break` 路径上那份「退出时的收尾副本」
+（`body_pops=[54]`）。reader 的模型是「`try` 体到收尾为止」，于是体被截断在
+`break` 那里：内层 `try/except/finally` 落在体外、`finally` 子句找不到（读成
+`pass`）、`break` 被读到 `try` 外面，多上下文管理器因此只折成一半。
+
+3.9/3.10 里正路的那份收尾在流水更后面，「取最后一个同层 `POP_BLOCK`」正好取对；
+3.11 没有那份，只能取到退出路径上的。**要修得让 `Rewriter` 在正路末尾补一个
+收尾**（3.11+ 的 `_place_one_close` 目前按异常表各段的末端安置，退出路径的
+那段也被算进去了），或者让 reader 在 3.11+ 布局下改按「内联子句副本的起点」
+收尾；两处都动到 `cfg_flow.py` 的区域分析与 `decomp311.py` 的收尾安置，尚未动手。
+
+试过三条捷径，都不成立：
+
+* 把 reader 的 `try` 体末尾改成「内联子句副本的起点」——退出路径上那份副本
+  也在体内，reader 会在体内撞见 `POP_BLOCK` 而提前组装 `try`，整个 `try`
+  反而消失。
+* 把 `Rewriter` 的收尾安置改成取所有同 handler 区间的末端——末段是子句副本
+  的保护区，收尾被放到 handler 里，等于没放。
+* 让 `Rewriter` 把收尾放在内联子句副本前面（`_finally_copy_start`）——找到的
+  副本前面正好是编译器留的 `NOP`，而 `NOP` 这一步不产出指令，收尾的
+  `POP_BLOCK` 就跟着一起丢了（`_translate_step` 只在「这一步产出了东西」时
+  才补收尾）。
+
+补充几点机制，读代码时用得上：
+
+* reader 跳过体内撞见的 `POP_BLOCK`（`_emit_statements` 里
+  `start <= block["instr_start"] < i < block["try_end_idx"]` 那一段），因为它
+  假定 `try` 体的收尾是最后一条；3.11 布局里退出路径那份收尾落在体内，
+  reader 只能靠「体内撞见就跳过」这条规则把它放过，于是正路上那份收尾
+  必须由 `Rewriter` 补出来。
+* 3.11 编译器在正路上那份内联子句副本前面留了一个 `NOP`（boom.py 的
+  `ultimate_cf_nightmare` 里在偏移 1496），正是 3.9 写 `POP_BLOCK` 的位置。
+  收尾就该落在那个 `NOP` 上；但 `_translate_step` 只在「这一步产出了东西」
+  时才补 `POP_BLOCK`，`NOP` 恰恰什么都不产出，收尾会跟着一起丢掉。
+* 只补收尾还不够：3.11 布局下内联子句副本在正路、退出路径、handler 里各有一
+  份，`_trim_finally_tail` 会把与 handler 那份同形的那份丢掉。收尾补对之后，
+  reader 要在 `try_end_idx + 1` 处读到子句——那里得确实有子句副本，否则
+  `finally` 子句仍然读不出来（3.11 的 `_collect_finally_body` 有从 handler
+  取子句的分支，但前提是收尾与 handler 之间没有别的指令）。
+
+也就是说这一处要三处一起改：`Rewriter` 把收尾放到正路那份内联子句副本之前
+（`NOP` 那个槽位）、`_translate_step` 允许 `NOP` 作锚点也补收尾、reader 在
+3.11+ 布局下按「子句副本的起点」而不是「收尾之后」取子句。三者缺一，3.11 的
+`try`/`finally` 都会读歪。
 
 ---
 

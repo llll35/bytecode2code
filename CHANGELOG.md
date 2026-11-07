@@ -8,6 +8,97 @@ All notable changes to this project are recorded here. The format follows
 
 ### Fixed
 
+- 3.11-3.15: a `finally` block's setup is no longer promoted across an
+  unrelated `try` statement. `Rewriter._region_start` required only equal
+  exception-table depth and handler-address ordering, which are not a nesting
+  relation, so the enclosing `finally` opened inside the previous `try`'s
+  body; the reader then read that clause's `continue` as a `break` and
+  swallowed the loop's `else` and the trailing `try/finally` whole.
+  Promotion now also walks the table's protection chain from the candidate
+  handler to the proposed enclosing one. `boom.py` AST diff: 3.12/3.13 80 ->
+  65 lines, 3.14/3.15 42 -> 15 lines; 3.11 unchanged at 36 (it does not
+  promote on this sample) and the gate stays 340/340.
+
+- 3.11-3.15: a `with` that ends a loop body no longer hides the loop's `else`
+  clause and the code after the loop. `Decompiler310._process_with` marked the
+  span from the teardown to the handler consumed to hide 3.10's duplicated
+  post-block code, but with no such duplicate present that span is real source;
+  the hide is now skipped when the run past the teardown is an unconditional
+  jump back to before the `with` setup (an enclosing loop back edge).
+- 3.11-3.15: a `continue` inside `except ... as e` (or any block with a
+  `finally`) is no longer read as `break`. 3.11+ compiles it as a forward jump
+  to the clause copy on the exit path, which then jumps back to the loop head;
+  `_classify_jump` now follows that landing run to its own jump and recovers
+  the `continue` when it aims at the innermost head. Together these make
+  `boom.py` byte-identical on 3.14 and 3.15; the gate stays 340/340.
+
+- 3.11: a nested `with a as x, b as y:` no longer collapses to a single `with`.
+  `Rewriter._analyse_with` anchored the outer block's close at the last
+  reachable `__exit__` range, which could be the outer manager's `__exit__` run
+  while the nested block unwinds (reachable because the nested handler's normal
+  exit jumps to it). Ranges beginning at or after another `with` handler's head
+  are now excluded as unwind tail, so the outer close lands at the body's own
+  `__exit__`. `boom.py` 3.11 AST diff 36 -> 33 lines; gate stays green.
+
+- 3.12/3.13: a nested `with` body no longer collapses to `continue` with the
+  try read outside the loop. `Rewriter._analyse_exception_loop_exits` registered
+  any exception-region end landing on a NOP as a loop break, including the
+  inner `with`'s normal-path close anchor; the synthetic exit jump then swallowed
+  the `POP_BLOCK` the `with` needs. Registration now skips anchors already in
+  `with_closes`. `boom.py` 3.12/3.13 AST diff 65 -> 53 lines; gate stays green.
+
+* **A `for` loop was read as a `while True:` on 3.11-3.15** -- 3.11+ leaves the
+  `EXTENDED_ARG` prefix a jump names in the stream, and the jump names the
+  prefix rather than the instruction behind it, so the loop head the reader
+  remembered and the address a back edge aims at were two bytes apart. The
+  head of a loop is the prefix's address now, and the scan for a `while
+  True:` back edge looks past the prefix before it takes the head for one.
+* **The copies of a `with`'s teardown that an early exit writes were read as
+  statements** -- 3.9 and 3.10 spell the teardown `LOAD_CONST None;
+  DUP_TOP; DUP_TOP; CALL_FUNCTION 3; POP_TOP` (the callable is duplicated
+  onto the stack), 3.11 and later spell it three `LOAD_CONST None` over
+  `CALL_FUNCTION 2` (the callable is already on the stack). Both shapes are
+  recognised now.
+* **`boom.py` decompiled to something else than its source on 3.10** -- four
+  separate causes, all in the 3.9/3.10 reader and the 3.10 disassembler:
+  a branch that names a merged `EXTENDED_ARG` names an address no instruction
+  carries, so the `continue` back to the loop head was not recognised (3.9
+  already forwarded such a target to the next surviving instruction, 3.10 now
+  does the same); the copies of a `with`'s `__exit__(None, None, None)`
+  teardown that an early exit writes were read as statements; the window
+  between a handler's body and the end of the clause holds the compiler's own
+  unwinding -- the copies of the clauses of the blocks the handler sits in --
+  and the exit, so the window is marked as handled and only the exit is
+  emitted; and that exit was only recognised when the window held something
+  behind it. `boom.py` is now AST-identical to its source on 3.10, and 3.9
+  still is.
+* **A jump back to a `for` loop's head was read as the back edge of a
+  `while True:`** -- when the reader could not name the loop (the loop stack
+  was empty at that point), the jump was handed to the `while True` reader,
+  which did not check that the head it landed on was a `FOR_ITER`. The `for`
+  loop's body was then read a second time, inside itself, and on 3.12/3.13 the
+  `boom.py` sample died with `RecursionError: maximum recursion depth
+  exceeded`. A jump to a `FOR_ITER`/`GET_ITER` head is a `continue` into that
+  loop now, never the start of a second loop.
+* **The inline copy of a `finally` clause inside a loop body was moved out of
+  the loop on 3.11-3.15** -- the search for a tail stranded in front of a
+  handler decided that a run was part of the loop body only when the run
+  itself jumped back to the loop head. An inlined `finally` at the merge point
+  jumps to the copy of the clause behind it, and that copy is what ends the
+  loop, so the run was taken for the code behind the loop and moved -- and a
+  `try`/`except`/`finally` inside a `for` was read twice. The flow out of the
+  run is followed now.
+* **A tail re-emitted at its merge point brought back instructions that had
+  been dropped for another reason on 3.11-3.15** -- the pop 3.13 writes behind
+  an `END_FOR` is dropped, and re-emitting the tail past the handlers undid
+  that drop, so the pop showed up as a statement of its own. Only the offsets
+  the tail itself drops are resurrected now.
+* **A `continue` written inside a `try` that sits inside a `with` was read as
+  the clause's copy followed by a statement** -- the compiler emits the copy of
+  the `finally` clause, then the `with`'s own teardown, and only then the jump
+  back to the loop head. The copy was recognised, but the exit behind the
+  teardown was not looked for, so the copy was read as a statement of the
+  body. The unwind is stepped over before the jump is looked for now.
 * **A `try` inside a `with` was lost on every version** -- the `try`'s
   `POP_BLOCK` sits right in front of the `with`'s own, and the search for the
   block's end took the outer one, so the whole `try` statement disappeared.
@@ -192,6 +283,38 @@ All notable changes to this project are recorded here. The format follows
   the instruction stream: the pair counts as the implicit epilogue when the walk
   reaches it at the end of the body, whether or not handler code is still listed
   behind it. ROUND-TRIP 262/263 → **263/263**.
+* **`boom.py` exploded on 3.9** -- the stray-tail re-linearisation added for 3.12
+  also ran on genuine 3.9/3.10 streams, where a `SETUP_FINALLY` names the inlined
+  clause rather than an out-of-line handler, so it cut a `try` in half and
+  duplicated every `finally`. The move is behind a class flag now
+  (`HOIST_STRAY_BLOCK_TAILS`, off in the base reader, on only for the
+  back-translated 3.11+ view) and 3.9 round-trips `boom.py` to an identical AST.
+* **Every function grew a phantom docstring on 3.14/3.15** -- those versions no
+  longer reserve `co_consts[0]` for the docstring, so the first constant the body
+  uses sits in that slot and a string there was pasted back as a docstring
+  (`"""stop"""` over and over). A docstring is the one constant the body never
+  loads, so a `LOAD_CONST` of the slot now suppresses the recovery.
+* **A function ending in an `if` repeated its implicit `return None` inside the
+  body on 3.10** -- 3.10 writes the epilogue once per branch, and the pair that
+  closed the branch was only recognised when it ended the stream. Two pairs in a
+  row at the end are one epilogue seen twice.
+* **`with` teardown leaked as `None(None, None, None)` on 3.11–3.15** -- a
+  `break`/`continue` leaving a `with` body runs the manager's `__exit__` on the
+  way out, and 3.11+ pastes a copy of that call behind every such exit. Only the
+  body's own falling-out copy was folded, so the loop-exit copies showed up as a
+  literal `None(...)` call. `Rewriter._drop_with_unwind_teardowns` drops them,
+  keyed off the exception table pinning the run to a `with` handler plus the
+  operands being preceded by a statement completion rather than a callable load
+  (which is what a real `foo(None, None, None)` always pushes first).
+* **`boom.py` collapsed to a 4-line stub on 3.14/3.15** -- 3.14's `with` collapse
+  leaves one `POP_BLOCK` for both `SETUP_WITH`s, so the CFG block-stack walk
+  credits a `SETUP_WITH` -- and a `try` read inside its body -- a close that lies
+  past the body being read, and the reader dropped everything after the first
+  `if …: continue`. `_find_pop_block` now checks a `with` close is followed by
+  its `__exit__` teardown before trusting the graph, and takes a `limit` (the
+  enclosing body's end) to re-derive the close by a clamped scan. `with` bodies
+  with an interleaved `finally` read in full again. ROUND-TRIP **263/263**,
+  CONTROL FLOW **77/77** unchanged.
 
 ### Added
 

@@ -404,6 +404,7 @@ class Rewriter(object):
         self._handler_heads = set()
         self.with_setups, self.with_closes, self.with_swaps, \
             self.with_exits = self._analyse_with()
+        self._drop_with_unwind_teardowns()
         self.try_setups, self.try_closes = self._analyse_try()
         self.supers = self._analyse_super()
         self.comprehensions = self._analyse_comprehensions()
@@ -755,8 +756,9 @@ class Rewriter(object):
         if not hasattr(self, '_tail_offsets'):
             self._tail_offsets = set()
         for raw in tail_instructions:
-            self._drops.add(raw.offset)
-            self._tail_offsets.add(raw.offset)
+            if raw.offset not in self._drops:
+                self._drops.add(raw.offset)
+                self._tail_offsets.add(raw.offset)
 
     def _merge_offset(self, entry):
         """Offset just past every handler block belonging to *entry*.
@@ -994,6 +996,14 @@ class Rewriter(object):
             if any(entry.start <= t < entry.end
                    for t in handler_targets if t != entry.target):
                 continue
+            # A range that begins at or after another ``with`` handler's head
+            # is the outer manager's ``__exit__`` run while the nested block
+            # unwinds -- not the body's own close.  It can be reachable (the
+            # nested handler's normal exit jumps to it), so the reachability
+            # test below does not catch it; anchoring there parks the outer
+            # ``POP_BLOCK`` inside the handler tail.
+            if any(entry.start >= t for t in targets if t != entry.target):
+                continue
             position = by_offset.get(entry.end)
             if position is None:
                 continue
@@ -1030,6 +1040,60 @@ class Rewriter(object):
             if exit_call is not None:
                 exits.add(exit_call.offset)
         return setups, closes, swaps, exits
+
+    #: Instructions that can sit in front of an ``__exit__(None, None, None)``
+    #: teardown: the completion of the statement that left the block, or the
+    #: rotation the compiler runs to expose the pending value.  A real call
+    #: ``foo(None, None, None)`` instead pushes ``foo`` -- a load -- right in
+    #: front of its first argument, so a load there means the run is source, not
+    #: the manager's teardown.
+    _TEARDOWN_PRED_OPS = frozenset((
+        "POP_TOP", "NOP", "SWAP", "COPY", "ROT_TWO", "ROT_THREE", "ROT_FOUR",
+    ))
+
+    def _drop_with_unwind_teardowns(self):
+        """Drop the inline ``__exit__(None, None, None)`` a loop exit leaves.
+
+        A ``break``/``continue`` that leaves a ``with`` body still has to run
+        each manager's ``__exit__`` on the way out.  3.14 threads a copy of that
+        call -- three ``None`` operands, the call and the discard of its result
+        -- behind every such exit.  :meth:`_analyse_with` folds only the body's
+        own falling-off-the-end copy, so the loop-exit copies survive and the
+        reader emits them as a literal ``None(None, None, None)``.  The manager
+        method these runs call was pushed at the block's entry, so the run is
+        bounded by a statement completion rather than a callable load, and the
+        exception table pins it to a ``with`` handler -- two facts a genuine
+        ``foo(None, None, None)`` never satisfies together.
+        """
+        raw_list = self.raw
+        by_offset = {raw.offset: n for n, raw in enumerate(raw_list)}
+        with_targets = getattr(self, "with_targets", set())
+        if not with_targets:
+            return
+        pinned = {entry.start for entry in _exception_entries(self.code)
+                  if entry.target in with_targets}
+        for index, raw in enumerate(raw_list):
+            if raw.opname != "LOAD_CONST" or raw.argval is not None:
+                continue
+            call = raw_list[index + 3] if index + 3 < len(raw_list) else None
+            after = raw_list[index + 4] if index + 4 < len(raw_list) else None
+            if call is None or call.opname not in ("CALL", "CALL_KW"):
+                continue
+            if after is None or after.opname != "POP_TOP":
+                continue
+            if call.offset in self.with_exits:
+                continue    # the body's own close, folded already
+            if not all(next_.opname == "LOAD_CONST" and next_.argval is None
+                       for next_ in raw_list[index:index + 3]):
+                continue
+            pred = raw_list[index - 1] if index else None
+            pinned_here = raw.offset in pinned
+            pred_ok = pred is not None and (
+                pred.opname in self._TEARDOWN_PRED_OPS
+                or (pred.opname == "LOAD_CONST" and pred.argval is None))
+            if not (pinned_here or pred_ok):
+                continue
+            self._drops.update(next_.offset for next_ in raw_list[index:index + 5])
 
     def _with_setup_index(self, index):
         """Index of the ``BEFORE_WITH`` that opens the block *index* belongs to.
@@ -1426,7 +1490,8 @@ class Rewriter(object):
         ours in front of it.  Only a chain at our own unwinding depth qualifies:
         a dispatch we reach across a shallower or deeper region belongs to an
         earlier, disjoint statement whose body lies behind us, and anchoring at
-        it opens our block around a whole other statement.
+        it opens our block around a whole other statement.  Equal depth alone
+        is not enough: the handler's protection chain must reach our target.
         """
         heads = self._table_heads(entries)
         depth = self._region_depth(entries, start, target)
@@ -1439,11 +1504,28 @@ class Rewriter(object):
                     continue
                 if entry.end == begins or (entry.target in heads
                                            and (depth is None
-                                                or entry.depth == depth)):
+                                                or entry.depth == depth)
+                                           and self._handler_reaches(
+                                               entries, entry.target, target)):
                     begins = entry.start
                     break
             else:
                 return begins
+
+    def _handler_reaches(self, entries, handler, target):
+        """Whether a handler's exception-table protection chain reaches target."""
+        pending = [handler]
+        seen = set()
+        while pending:
+            offset = pending.pop()
+            if offset == target:
+                return True
+            if offset in seen:
+                continue
+            seen.add(offset)
+            pending.extend(entry.target for entry in entries
+                           if entry.start <= offset < entry.end)
+        return False
 
     def _region_depth(self, entries, start, target):
         """The unwinding depth the table gives the region we are anchoring.
@@ -2698,6 +2780,11 @@ class Decompiler311(Decompiler310):
     #: handler-tail shim must not run a second time.
     _copied_none_return = False
 
+    #: The re-linearisation only makes sense for the view ``Rewriter`` lays out:
+    #: it is the one that parks a threaded-out tail in front of the out-of-line
+    #: handler.
+    HOIST_STRAY_BLOCK_TAILS = True
+
     def __init__(self):
         super().__init__()
         self.dis = TranslatingDisassembler()
@@ -2779,6 +2866,39 @@ class Decompiler311(Decompiler310):
         ):
             body.pop()
         return body, resume
+
+    def _try_body_end(
+        self,
+        instructions,
+        setup_idx,
+        target,
+        try_end_idx,
+        handler_start_idx,
+    ):
+        """Index just past the body of a 3.11+ ``try``.
+
+        3.11 and later have no block stack: the block is closed only on the
+        paths that unwind it, so the close the graph finds belongs to an exit
+        path and the body runs on past it.  The body ends where the inline
+        copy of the clause starts -- the clause the handler holds, copied into
+        the normal path.
+        """
+        length = self._finally_clause_length(instructions, handler_start_idx)
+        if length <= 1:
+            return try_end_idx
+        ops = self._clause_ops(instructions, handler_start_idx, length)
+        if len(ops) <= 1:
+            return try_end_idx
+        best = None
+        j = try_end_idx + 1
+        while j < handler_start_idx:
+            if instructions[j].opname == ops[0] \
+                    and self._copy_matches(instructions, j, ops) is not None:
+                best = j
+            j += 1
+        if best is None:
+            return try_end_idx
+        return best - 1
 
     def _handler_end(
         self, instructions, handler_start_idx: int

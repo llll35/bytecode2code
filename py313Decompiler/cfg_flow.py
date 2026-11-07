@@ -196,6 +196,23 @@ class CFG:
         return order
 
 
+def _address_map(instructions: Sequence) -> Dict[int, int]:
+    """Map an address to the instruction that carries it.
+
+    The back-translated stream can hold two instructions at one address: the
+    ``SETUP_FINALLY`` the rewriter synthesises for a ``try`` shares the
+    address of the instruction it opens.  The reader resolves an address to the
+    *first* instruction carrying it -- the synthesised setup, which is what the
+    branch was compiled against -- so the graph has to agree with it: with the
+    last one winning, the setup is stepped over, the block stack misses a push
+    and every later ``POP_BLOCK`` is credited to the wrong region.
+    """
+    mapping: Dict[int, int] = {}
+    for position, instr in enumerate(instructions):
+        mapping.setdefault(instr.offset, position)
+    return mapping
+
+
 def _jump_target(instr, offset_to_index: Dict[int, int]) -> Optional[int]:
     """Instruction index a jump/SETUP operand points at."""
     if instr.opname not in _TARGETED_OPS or instr.argval is None:
@@ -214,8 +231,7 @@ def build_cfg(instructions: Sequence) -> CFG:
     after any terminator or conditional branch -- the classical rules, plus the
     ``SETUP_*`` operands, which name a handler entry no jump points at.
     """
-    offset_to_index = {instr.offset: position
-                       for position, instr in enumerate(instructions)}
+    offset_to_index = _address_map(instructions)
     names = [instr.opname for instr in instructions]
 
     leaders: Set[int] = {0}
@@ -339,7 +355,9 @@ def classify_handler(instructions, entry: int, setup_op: str = "") -> str:
 
     ``DUP_TOP`` followed by ``JUMP_IF_NOT_EXC_MATCH`` is an ``except`` chain:
     the exception is duplicated so each clause's type test can bail out to the
-    re-raise.  ``LOAD_CONST None / STORE_FAST / DELETE_FAST / RERAISE`` is the
+    re-raise.  Three ``POP_TOP`` at the front are a catch-all ``except:``,
+    which unwinds the stack without testing the type.  ``LOAD_CONST None /
+    STORE_FAST / DELETE_FAST / RERAISE`` is the
     cleanup the compiler wraps around an ``except ... as name`` body so the name
     is unbound on every exit, including an exception raised inside it.  A
     ``with`` region is named by its own setup opcode.  Anything else runs
@@ -350,6 +368,8 @@ def classify_handler(instructions, entry: int, setup_op: str = "") -> str:
     window = [instr.opname for instr in instructions[entry:entry + 8]]
     if not window:
         return KIND_FINALLY
+    if window[:3] == ["POP_TOP", "POP_TOP", "POP_TOP"]:
+        return KIND_EXCEPT
     if window[0] == "DUP_TOP" and "JUMP_IF_NOT_EXC_MATCH" in window[:4]:
         return KIND_EXCEPT
     if (window[0] == "LOAD_CONST" and instructions[entry].argval is None
@@ -376,8 +396,7 @@ class ExceptionAnalyzer:
     def __init__(self, instructions: Sequence, cfg: Optional[CFG] = None):
         self.instructions = instructions
         self.cfg = cfg if cfg is not None else build_cfg(instructions)
-        self._offset_to_index = {instr.offset: position
-                                 for position, instr in enumerate(instructions)}
+        self._offset_to_index = _address_map(instructions)
 
     def setup_sites(self) -> List[Tuple[int, str, int]]:
         """``(setup index, opname, handler index)`` for every block push."""

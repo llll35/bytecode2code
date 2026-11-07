@@ -396,6 +396,22 @@ class Decompiler310(_BaseDecompiler):
             i += 1
         return i
 
+    def _with_tail_is_back_edge(self, instructions, tail_end: int, instr) -> bool:
+        """Whether the run past the teardown is an enclosing loop's back edge.
+
+        The duplicate-tail hide assumes the code between the teardown and the
+        handler is a copy of what follows the block.  A ``with`` that ends a
+        loop body has no such copy: control leaves through the loop's back
+        edge, and the span up to the handler is the loop's ``else`` clause and
+        the statements after the loop.  An unconditional jump aimed before the
+        ``with`` setup is that back edge, so the span must stay readable.
+        """
+        if tail_end >= len(instructions):
+            return False
+        ins = instructions[tail_end]
+        return (ins.opname in ("JUMP_ABSOLUTE", "JUMP_FORWARD")
+                and self._jump_target(ins) < instr.offset)
+
     def _find_with_tail_end(self, instructions, start: int, hard_end: int) -> int:
         """End of the straight-line block that starts at ``start``."""
         i = start
@@ -434,7 +450,8 @@ class Decompiler310(_BaseDecompiler):
         if merge >= handler_start or cleanup_end is None:
             return consumed
         tail_end = self._find_with_tail_end(instructions, merge, handler_start)
-        if tail_end < handler_start:
+        if tail_end < handler_start and not self._with_tail_is_back_edge(
+                instructions, tail_end, instr):
             self._handled_ranges.append((tail_end, handler_start))
         duplicated = handler_start - merge
         self._handled_ranges.append(

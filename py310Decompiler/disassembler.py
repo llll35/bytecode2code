@@ -1,3 +1,4 @@
+import bisect
 import dis
 import inspect
 import opcode
@@ -144,12 +145,37 @@ class Disassembler:
             i += 1
         return merged
 
+    def _resolve_extended_targets(self, instr_list: list) -> list:
+        """Point every jump at an instruction the reader actually has.
+
+        ``dis`` reports the target of a jump as an address, and a target whose
+        instruction carries an ``EXTENDED_ARG`` prefix is reported as the
+        address of that prefix.  Merging the prefix away leaves the address
+        naming an instruction that is no longer in the stream, so the loop head
+        or handler a branch means reads as two bytes short of itself and matches
+        nothing that compares against an offset.  Forwarding such a target to
+        the next surviving instruction restores where the machine lands.
+        """
+        live = sorted(instr.offset for instr in instr_list)
+        jump_ops = self._hasjrel | self._hasjabs
+        resolved = []
+        for instr in instr_list:
+            if instr.opcode in jump_ops and instr.argval is not None:
+                target = int(instr.argval)
+                if target not in live:
+                    following = bisect.bisect_left(live, target)
+                    if following < len(live):
+                        instr = instr._replace(argval=live[following])
+            resolved.append(instr)
+        return resolved
+
     def disassemble(self, code, show_lineno: bool = True) -> List[Instruction]:
         instructions: List[Instruction] = []
         jump_targets: set = set()
         raw_instr_list = list(dis.get_instructions(code, **_GET_INSTRUCTIONS_KWARGS))
         # Merge EXTENDED_ARG into following instructions
         instr_list = self._merge_extended_args(raw_instr_list)
+        instr_list = self._resolve_extended_targets(instr_list)
         for instr in instr_list:
             if instr.opcode in self._hasjrel or instr.opcode in self._hasjabs:
                 if instr.argval is not None:
