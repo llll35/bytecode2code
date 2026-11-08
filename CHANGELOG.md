@@ -8,6 +8,15 @@ All notable changes to this project are recorded here. The format follows
 
 ### Fixed
 
+- Python 3.9–3.15: restore the source, bytecode and behaviour of the reported
+  `crash_test.py` (archived as `tests/repro/crash_stack.py`). Loop handler gaps
+  no longer consume post-loop return operands or invent trailing continues;
+  walrus operands remain inside short-circuit conditions. Finally returns keep
+  their values and exception-suppression semantics without duplicate expression
+  evaluation, and 3.15 loop-unwind pops no longer discard pending return values.
+  Eight cross-version regression checks are included in `tests/run.py` without
+  changing the legacy gate counts.
+
 - 3.11-3.15: a `finally` block's setup is no longer promoted across an
   unrelated `try` statement. `Rewriter._region_start` required only equal
   exception-table depth and handler-address ordering, which are not a nesting

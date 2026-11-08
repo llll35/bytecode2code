@@ -104,6 +104,7 @@ tests/
   test_cfg.py           CFG / Rewriter / output-normalisation units
   control_flow_cases.py shared modern control-flow scenarios
   test_modern_control_flow.py exception-region and behaviour checks for 3.11–3.13
+  test_crash_regression.py stack/cleanup/short-circuit regression for 3.9–3.15
   repro/                one-off reproduction inputs
 
 embed_python/           the seven CPython interpreters (not tracked)
@@ -169,7 +170,11 @@ BYTECODE2CODE_TESTS_GROUP=3.10 BYTECODE2CODE_TESTS_OUT=results.json \
 The report includes **ROUND-TRIP** checks, **CONTROL FLOW** block-boundary
 probes, and combined control-flow checks for Python 3.11–3.13. The combined
 suite compares structure and observable behavior across 81 scenarios and is
-run under each target interpreter. Results and known limitations are tracked
+run under each target interpreter. A separate crash regression checks
+`tests/repro/crash_stack.py` and related boundary cases on all seven versions,
+including AST fidelity, round-trips, exceptions, and evaluation order. Run it
+alone with `embed_python/python-X.Y/python.exe tests/test_crash_regression.py`.
+Results and known limitations are tracked
 in `bugs.md`.
 
 ## Limitations

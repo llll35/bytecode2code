@@ -470,6 +470,7 @@ class Rewriter(object):
         self._mark_dead_handlers()
         self._redirect_handler_exits()
         self._analyse_exception_loop_exits()
+        self._restore_loop_return_copies()
         self._retarget_dropped_epilogues()
 
     def _normalise_raw(self, raw_list):
@@ -954,6 +955,51 @@ class Rewriter(object):
                 if raw.opcode in jump_ops and raw.argval == loop_head:
                     self._retarget[raw.offset] = target_offset
 
+    def _restore_loop_return_copies(self):
+        """Recover a break whose target was replaced by a post-loop return."""
+        loops = [(raw.offset, raw.argval, raw.positions.col_offset)
+                 for raw in self.raw if raw.opname == 'FOR_ITER']
+        returns = []
+        for end, raw in enumerate(self.raw):
+            if raw.opname not in ('RETURN_VALUE', 'RETURN_CONST'):
+                continue
+            position = getattr(raw, 'positions', None)
+            if position is None or position.lineno is None:
+                continue
+            start = end
+            needed = 1 if raw.opname == 'RETURN_VALUE' else 0
+            while needed > 0 and start > 0:
+                previous = self.raw[start - 1]
+                if (previous.opname in _STMT_BREAK_OPS
+                        or previous.opname.startswith(('JUMP', 'POP_JUMP'))
+                        or previous.opname in ('FOR_ITER', 'SEND', 'YIELD_VALUE')):
+                    break
+                effect = 1 if previous.opname == 'LOAD_FAST' else _stack_effect(previous)
+                needed -= effect
+                start -= 1
+            if needed == 0:
+                returns.append((start, end, position))
+        for start, end, position in returns:
+            if self.raw[start].offset in self._drops:
+                continue
+            for tail, tail_end, other_position in returns:
+                if (tail <= end or other_position != position
+                        or end - start != tail_end - tail):
+                    continue
+                if not any(head < self.raw[start].offset < stop <= self.raw[tail].offset
+                           and (column is None or position.col_offset is None
+                                or position.col_offset <= column)
+                           for head, stop, column in loops):
+                    continue
+                if not all(_same_clause_op(a, b) for a, b in zip(
+                        self.raw[start:end + 1], self.raw[tail:tail_end + 1])):
+                    continue
+                self._loop_breaks = getattr(self, '_loop_breaks', {})
+                self._loop_breaks[self.raw[start].offset] = self.raw[tail].offset
+                self.jump_targets.add(self.raw[tail].offset)
+                self._drops.update(raw.offset for raw in self.raw[start + 1:end + 1])
+                break
+
     def _save_tail_for_merge(self, tail_start, merge_offset):
         """Save tail instructions to be emitted at the merge point.
 
@@ -977,6 +1023,24 @@ class Rewriter(object):
                 tail_instructions.append(raw)
         if not tail_instructions:
             return
+        merge_index = self._offset_index(merge_offset)
+        inline_return = next((raw for raw in tail_instructions
+                              if raw.opname in ('RETURN_VALUE', 'RETURN_CONST')), None)
+        if merge_index is not None and inline_return is not None:
+            merge = raw_list[merge_index]
+            if (merge.opname == 'LOAD_CONST' and merge.argval is None
+                    and merge_index + 1 < len(raw_list)
+                    and raw_list[merge_index + 1].opname == 'RETURN_VALUE'):
+                merge = raw_list[merge_index + 1]
+            position = getattr(inline_return, 'positions', None)
+            if (getattr(position, 'lineno', None) is not None
+                    and position == getattr(merge, 'positions', None)
+                    and _same_clause_op(inline_return, merge)):
+                # The finally handler already computes this very return.
+                # Pasting the normal copy before its RETURN_VALUE evaluates
+                # the expression twice and obscures its exception-stack drain.
+                self._drops.update(raw.offset for raw in tail_instructions)
+                return
         # Store for emission at merge point
         if not hasattr(self, '_tails_at_merge'):
             self._tails_at_merge = {}
@@ -2380,6 +2444,23 @@ class Rewriter(object):
         step = self._return_none_at(index)
         if step is None:
             return
+        if not hasattr(self, '_source_none_return_spans'):
+            self._source_none_return_spans = set()
+            for candidate in range(2, len(self.raw)):
+                position = getattr(self.raw[candidate], 'positions', None)
+                if (self._return_none_at(candidate) == candidate
+                        and getattr(position, 'lineno', None) is not None
+                        and self.raw[candidate - 1].opname == 'POP_EXCEPT'
+                        and self.raw[candidate - 2].opname == 'POP_TOP'
+                        and position == self.raw[candidate - 1].positions
+                        and position == self.raw[candidate - 2].positions):
+                    # Draining an active exception and returning None suppresses
+                    # it. This is a source return, not a function epilogue.
+                    self._source_none_return_spans.add(position)
+        if (getattr(self.raw[step], 'positions', None) in self._source_none_return_spans
+                or any(raw.opname == 'FOR_ITER' and isinstance(raw.argval, int)
+                       and raw.offset < self.raw[step].offset < raw.argval for raw in self.raw)):
+            return
         copied = [self.raw[step].offset]
         if self.raw[step].opname == 'LOAD_CONST':
             copied.append(self.raw[step + 1].offset)
@@ -2832,10 +2913,11 @@ class Rewriter(object):
         """
         raw = self.raw[index]
         close_after = raw.offset in self.try_closes
-        before = len(out)
         result = self._translate_instruction(
             index, out, runs, shape, close_merges, ignore_drops)
-        if close_after and len(out) > before:
+        if close_after:
+            # A threaded return can be dropped while its boundary remains the
+            # normal-path close. Losing that pop moves break outside its guard.
             # 3.9 closed the block straight after the last instruction of the
             # protected region.  The inline ``else``/``finally`` clause 3.11
             # kept in front of the handler follows right after it, and the
@@ -3305,6 +3387,7 @@ class Rewriter(object):
             line_no=line_no,
             is_jump_target=offset in self.jump_targets,
             synthetic_loop_exit=synthetic_loop_exit,
+            positions=getattr(raw, 'positions', None),
         )
 
 
@@ -3463,14 +3546,7 @@ class Decompiler311(Decompiler310):
         handler_end = self._handler_end(instructions, handler_start_idx)
         self._handled_ranges.append((handler_start_idx, handler_end))
 
-        body = self._emit_statements(
-            code, instructions, is_module=False, start=start, end=end,
-            out_stack=[],
-        )
-        while body and (
-            isinstance(body[-1], (ast.Pass, ast.Raise)) or _is_bare_return(body[-1])
-        ):
-            body.pop()
+        body = self._emit_finally_suite(code, instructions, start, end, handler_start_idx)
         return body, resume
 
     def _try_body_end(

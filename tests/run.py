@@ -66,13 +66,15 @@ def _run_group(version: str) -> int:
     """Child entry point: round-trip *version*'s samples and the probes."""
     from tests import test_roundtrip
     from tests.test_modern_control_flow import run as run_modern_flow
+    from tests.test_crash_regression import run as run_crash_checks
 
     names = [name for name, needed in _sample_versions().items()
              if needed == version]
     results = (test_roundtrip.run_file_samples(names)
                + test_roundtrip.run_probes()
                + test_roundtrip.run_flow_probes()
-               + run_modern_flow())
+               + run_modern_flow()
+               + run_crash_checks())
     with open(os.environ[OUT_ENV], "w", encoding="utf-8") as handle:
         json.dump([result._asdict() for result in results], handle)
     return 0
@@ -95,10 +97,12 @@ def _collect(version: str, workdir: str, index: int):
              if needed == version]
     if version == _running_version():
         from tests.test_modern_control_flow import run as run_modern_flow
+        from tests.test_crash_regression import run as run_crash_checks
         return (test_roundtrip.run_file_samples(names)
                 + test_roundtrip.run_probes()
                 + test_roundtrip.run_flow_probes()
-                + run_modern_flow())
+                + run_modern_flow()
+                + run_crash_checks())
 
     interpreter = _interpreter_for(version)
     if interpreter is None:
@@ -153,7 +157,7 @@ def main() -> int:
         failed = 0
         for version, results in collected:
             rows = [r for r in results if _is_flow(r) == include_flow
-                    and not r.name.startswith('modern_')]
+                    and not r.name.startswith(('modern_', 'crash_'))]
             if not rows:
                 continue
             print("\n-- Python %s --" % version)
@@ -203,6 +207,25 @@ def main() -> int:
                 print("      " + diff)
     print("\n%d/%d checks passed" % (modern_ok, modern_total))
     failed += modern_total - modern_ok
+
+    print()
+    print("=" * 60)
+    print("CRASH REGRESSION  (3.9--3.15 stack, cleanup, short-circuit evaluation)")
+    print("=" * 60)
+    crash_total = crash_ok = 0
+    for version, results in collected:
+        rows = [row for row in results if row.name.startswith('crash_')]
+        if not rows:
+            continue
+        print("\n-- Python %s --" % version)
+        for row in rows:
+            crash_total += 1
+            crash_ok += bool(row.ok)
+            print("  %-38s %s" % (row.name, 'OK' if row.ok else 'DIFF'))
+            for diff in row.diffs if VERBOSE else row.diffs[:2]:
+                print("      " + diff)
+    print("\n%d/%d checks passed" % (crash_ok, crash_total))
+    failed += crash_total - crash_ok
 
     print()
     print("=" * 60)

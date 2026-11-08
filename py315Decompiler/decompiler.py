@@ -378,6 +378,7 @@ class Decompiler:
         ("_loop_stack", list),
         ("_loop_heads", set),
         ("_tails_at_merge", dict),
+        ("_keep_clause_returns", lambda: False),
     )
 
     def _reset_reconstruction_state(self) -> None:
@@ -1178,6 +1179,17 @@ class Decompiler:
         """
         if self._match_loop_jump(merge_target) != "continue":
             return False
+        position = instructions[past_merge - 1].positions
+        previous = past_merge - 2
+        while previous >= 0 and instructions[previous].opname in (
+                "POP_EXCEPT", "POP_BLOCK", "EXTENDED_ARG", "NOP"):
+            previous -= 1
+        if (previous >= 0 and getattr(position, "lineno", None) is not None
+                and position == instructions[previous].positions
+                and instructions[previous].opname in (
+                    "STORE_FAST", "STORE_NAME", "STORE_GLOBAL", "STORE_DEREF",
+                    "STORE_ATTR", "STORE_SUBSCR", "POP_TOP")):
+            return True  # implicit latch inherits the preceding statement span
         if past_merge + 1 < len(instructions) and (
             instructions[past_merge].opname == "POP_EXCEPT"
             and _jump_target(instructions[past_merge + 1]) is not None
@@ -1426,17 +1438,25 @@ class Decompiler:
                 # The body already left through a loop back edge.  The gap
                 # beyond it is the loop's tail, not a successful try clause.
                 return []
-        gap = [k for k in range(try_end_idx + 1, handler_start_idx)
-               if instructions[k].opname not in self._BLOCK_NOISE]
+        upper = handler_start_idx
+        if self._loop_stack:
+            loop_exit = self._find_target_idx(instructions, self._loop_stack[-1][1])
+            if exit_idx < loop_exit:
+                upper = min(upper, loop_exit)
+        gap = [k for k in range(try_end_idx + 1, upper)
+               if instructions[k].opname not in self._BLOCK_NOISE
+               or instructions[k].opname == "POP_JUMP_IF_TRUE"]
         if not gap:
             return []
+        gap = sorted(set(gap).union(k for k in range(gap[0], upper)
+                                   if instructions[k].synthetic_loop_exit))
         end = gap[-1] + 1
         # The ``POP_TOP`` that discards an expression statement's value belongs
         # to the statement it closes, so the run right after the last real
         # instruction is part of the clause.  A ``POP_TOP`` further out belongs
         # to a ``with`` block the body opened, which the handler takes over.
         probe = end
-        while probe < handler_start_idx \
+        while probe < upper \
                 and instructions[probe].opname == "POP_TOP":
             probe += 1
         end = probe
@@ -1583,16 +1603,8 @@ class Decompiler:
             # ever got.  Read it there and resume past the handler, which is
             # where 3.9 put the code that follows a ``try``/``finally`` anyway.
             end = self._handler_end(instructions, handler_start_idx)
-            body = self._emit_statements(
-                code, instructions, is_module=False, start=start, end=end,
-                out_stack=[],
-            )
+            body = self._emit_finally_suite(code, instructions, start, end, handler_start_idx)
             self._handled_ranges.append((start, end))
-            while body and (
-                isinstance(body[-1], (ast.Pass, ast.Raise))
-                or _is_bare_return(body[-1])
-            ):
-                body.pop()
             return body, end
         # 3.9 ran the clause inline and then jumped over the handler; the jump
         # is the boundary, and the code after the ``try`` is past the handler.
@@ -1621,10 +1633,7 @@ class Decompiler:
                 resume = None
         if end <= start:
             return [], resume
-        body = self._emit_statements(
-            code, instructions, is_module=False, start=start, end=end,
-            out_stack=[],
-        )
+        body = self._emit_finally_suite(code, instructions, start, end, handler_start_idx)
         # The handler -- and, when a nested ``finally`` unwinds through it, its
         # prologue -- is not source.  Mark it only *after* the inline copy has
         # been read: the prologue range reaches back over the copy, so marking
@@ -1635,13 +1644,19 @@ class Decompiler:
             ),
             self._handler_end(instructions, handler_start_idx),
         ))
-        # The inline copy is followed by the handler's own re-raise, which is
-        # not part of the clause.
-        while body and (
-            isinstance(body[-1], (ast.Pass, ast.Raise)) or _is_bare_return(body[-1])
-        ):
-            body.pop()
         return body, resume
+
+    def _emit_finally_suite(self, code, instructions, start, end, handler_start_idx):
+        previous = self._keep_clause_returns
+        handler_end = self._handler_end(instructions, handler_start_idx)
+        self._keep_clause_returns = previous or (
+            handler_end > handler_start_idx
+            and instructions[handler_end - 1].opname in ("RETURN_VALUE", "RETURN_CONST"))
+        try:
+            return self._emit_statements(
+                code, instructions, is_module=False, start=start, end=end, out_stack=[])
+        finally:
+            self._keep_clause_returns = previous
 
     #: Conditional jumps that keep a ``finally`` copy open: a ``return`` inside
     #: such a branch belongs to the clause, not to whatever follows it.
@@ -2193,7 +2208,7 @@ class Decompiler:
                 i += ifexp_consumed
                 continue
             # Implicit `return None` tail of a function body.
-            if self._is_epilogue_pair(instructions, i, total) \
+            if not self._keep_clause_returns and self._is_epilogue_pair(instructions, i, total) \
                     and (is_module
                          or not self._tail_is_jump_reached(instructions, i)):
                 break
@@ -4515,7 +4530,7 @@ class Decompiler:
         # of the same unwinding.
         k = idx + 1
         while k < len(instructions) and instructions[k].opname in (
-            "ROT_TWO", "ROT_THREE", "ROT_FOUR", "POP_TOP", "POP_BLOCK"
+            "ROT_TWO", "ROT_THREE", "ROT_FOUR", "POP_TOP", "POP_BLOCK", "POP_EXCEPT"
         ):
             k += 1
         return k < len(instructions) and instructions[k].opname == "RETURN_VALUE"
@@ -4781,7 +4796,7 @@ class Decompiler:
                 return None
             expr, guard, merge = chained
             return expr, guard, merge, guard + 1, True
-        guard = self._find_ifexp_condition_jump(instructions, start, end)
+        guard = self._find_ifexp_condition_jump(instructions, start, end, allow_namedexpr=True)
         if guard is None:
             return None
         vals = self._eval_ifexp_expr(code, instructions, start, guard, stack)
@@ -4895,7 +4910,7 @@ class Decompiler:
         guards: List[int] = []
         i = idx
         while i < end:
-            guard = self._find_ifexp_condition_jump(instructions, i, end)
+            guard = self._find_ifexp_condition_jump(instructions, i, end, allow_namedexpr=True)
             if guard is None:
                 break
             vals = self._eval_ifexp_expr(code, instructions, i, guard, stack)
@@ -5630,12 +5645,18 @@ class Decompiler:
         return branch_base + [value], then_kinds | else_kinds
 
     def _find_ifexp_condition_jump(
-        self, instructions: List[Instruction], start: int, end: int
+        self, instructions: List[Instruction], start: int, end: int,
+        *, allow_namedexpr: bool = False,
     ) -> Optional[int]:
         for j in range(start, end):
             op = instructions[j].opname
             if op in ("POP_JUMP_IF_FALSE", "POP_JUMP_IF_TRUE"):
                 return j if j > start else None
+            if (allow_namedexpr and op in self._STORE_OPS and j > start
+                    and instructions[j - 1].opname == "DUP_TOP"
+                    and instructions[j].argval != "__classcell__"):
+                # This store is part of a walrus operand, not a statement.
+                continue
             if op not in self._IFEXP_EXPR_OPS:
                 return None
         return None

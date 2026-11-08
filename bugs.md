@@ -1,8 +1,46 @@
 # 项目缺陷清单（bugs.md）
 
-> 最后更新：2026-11-07。状态含义：
+> 最后更新：2026-11-08。状态含义：
 > **已修复** / **部分修复** / **未修复** / **不适用**。
 > 复现与验证命令见文末。
+
+---
+
+## 2026-11-08 crash_test.py 栈值、循环尾部与 finally 返回（AF）
+
+**状态：已修复。** 本次用户新增的 70 行样例归档为
+`tests/repro/crash_stack.py`，内容不变；已有的 `tests/repro/crash_test.py`
+是另一个异常压力样例，未覆盖或删除。
+
+- 3.12/3.13：`nested_chaos()` 的 try-else gap 被扫到位于循环之后的 handler，
+  连同 `return out` 的 `LOAD_FAST out` 一起消费，返回值变成 None。成功子句现在
+  以所在循环的正常出口为上界；条件与合成退出仍保留，纯退出不再被重复组装为 else。
+- handler 的自然回边与源级 continue 分开：3.11+ 用前一语句继承的 PEP 657 span
+  判断自然 latch，3.9/3.10 利用行表及清理指令判断。3.9/3.10 的 handler merge
+  折回循环头时，try-else 仍恢复在循环内，不吞掉循环之后的独立代码。
+- `walrus_and_shortcut()` 的海象赋值不再截断短路条件。仅在条件扫描中允许
+  DUP_TOP 后的命名表达式 store，不将普通 if/return 错折为条件表达式。
+- 3.9/3.10：finally handler 的旋转、异常栈清理不再截断 return；源级表达式语句
+  的 POP_TOP 与异常 drain 分开。finally 的显式 return None 不作为隐式收尾删除。
+  3.10 的 break 返回副本依同行表恢复，except 退出上的 finally-return 副本完整隐藏。
+- 3.14/3.15：保留源位置以识别 break 的返回副本；移除返回副本时仍发射其正常路径
+  close，避免将 break 从条件内移到条件外。finally handler 已有同一返回表达式时，
+  不再在 merge 点重复粘贴 normal copy，副作用只发生一次。具有实际异常 drain 的
+  return None 及对应正常副本保留。
+- 3.15：SWAP + 两个 POP_TOP 清理 iterator 与缓存的 next callable，不再弹掉
+  reader 自己的返回表达式栈值；独立源级 return 不被误还原成 break。
+
+`tests/test_crash_regression.py` 在各版本自己的解释器下独立编译，包含源码 AST、
+递归 code object 对照、五个原函数的边界输入、模块入口输出、异常路径与 try-else、
+独立循环 return、finally 求值次数和 and/or 海象短路副作用检查。已接入
+`tests/run.py` 的独立 CRASH REGRESSION 分组：**56/56**（8 项 × 7 版本）。
+原 ROUND-TRIP **263/263**、CONTROL FLOW **77/77**、组合控制流 **18/18**
+全部保持通过。SOURCE FIDELITY 的历史 `prime` / 3.9 语法展示差异不变。
+
+```powershell
+.\embed_python\python-3.12\python.exe tests\test_crash_regression.py
+.\embed_python\python-3.12\python.exe tests\run.py
+```
 
 ---
 

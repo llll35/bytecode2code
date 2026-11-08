@@ -28,6 +28,39 @@ class Decompiler310(_BaseDecompiler):
     #: clears the flag because its rewriter already drops those copies.
     _copied_none_return = True
 
+    def _process_instruction(self, instr, instructions, idx, code, stack, stmts,
+                             is_module=False, limit=None):
+        if self._copied_none_return and self._loop_stack and idx > 0:
+            stop = self._copied_loop_return_end(instructions, idx)
+            if stop is not None:
+                stmts.append(ast.Break())
+                return stop - idx
+        return super()._process_instruction(
+            instr, instructions, idx, code, stack, stmts,
+            is_module=is_module, limit=limit)
+
+    def _copied_loop_return_end(self, instructions, index):
+        """Undo a break's copied return using 3.10's line table, not columns."""
+        if instructions[index - 1].opname != "POP_TOP":
+            return None
+        tail = self._find_target_idx(instructions, self._loop_stack[-1][1])
+        if not index < tail < len(instructions):
+            return None
+        line = instructions[index].line_no
+        if line is None or line != instructions[tail].line_no:
+            return None  # independently written returns have different lines
+        width = 0
+        while index + width < tail and tail + width < len(instructions):
+            copied, original = instructions[index + width], instructions[tail + width]
+            if (copied.opname, copied.argval) != (original.opname, original.argval):
+                return None
+            width += 1
+            if copied.opname == "RETURN_VALUE":
+                return index + width
+            if copied.opname not in self._IFEXP_EXPR_OPS:
+                return None
+        return None
+
     def _drop_copied_return(self, body: List[ast.stmt]) -> List[ast.stmt]:
         """Remove the trailing ``return None`` a 3.10 handler carries.
 
@@ -95,6 +128,21 @@ class Decompiler310(_BaseDecompiler):
         finalbody, resume = super()._collect_finally_body(
             code, instructions, try_end_idx, handler_start_idx
         )
+        if (self._copied_none_return and finalbody
+                and isinstance(finalbody[-1], ast.Return) and resume is not None):
+            start = try_end_idx + 1
+            pattern = instructions[start:resume]
+            if pattern and pattern[-1].opname == "RETURN_VALUE":
+                # An except exit can carry a second inline copy of a finally
+                # return. Hiding only its expression leaves a stray bare return
+                # after the try. The source line distinguishes an actual return
+                # in the handler from this copy of the finally suite.
+                for index in range(resume, handler_start_idx - len(pattern) + 1):
+                    if (instructions[start].line_no is not None
+                            and instructions[index].line_no == instructions[start].line_no
+                            and all((a.opname, a.argval) == (b.opname, b.argval)
+                                    for a, b in zip(pattern, instructions[index:index + len(pattern)]))):
+                        self._handled_ranges.append((index, index + len(pattern)))
         if self._copied_none_return and resume is not None:
             end = self._implicit_return_at(instructions, resume)
             if end != resume:

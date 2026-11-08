@@ -376,6 +376,7 @@ class Decompiler:
         ("_loop_stack", list),
         ("_loop_heads", set),
         ("_tails_at_merge", dict),
+        ("_keep_clause_returns", lambda: False),
     )
 
     def _reset_reconstruction_state(self) -> None:
@@ -1159,6 +1160,17 @@ class Decompiler:
         """
         if self._match_loop_jump(merge_target) != "continue":
             return False
+        previous = past_merge - 2
+        while previous >= 0 and instructions[previous].opname in (
+                "POP_EXCEPT", "POP_BLOCK", "EXTENDED_ARG", "NOP"):
+            if instructions[previous].line_no is not None:
+                break  # cleanup carrying the source continue's line
+            previous -= 1
+        if (previous >= 0 and instructions[past_merge - 1].line_no is None
+                and instructions[previous].opname in (
+                    "STORE_FAST", "STORE_NAME", "STORE_GLOBAL", "STORE_DEREF",
+                    "STORE_ATTR", "STORE_SUBSCR", "POP_TOP")):
+            return True
         if past_merge + 1 < len(instructions) and (
             instructions[past_merge].opname == "POP_EXCEPT"
             and _jump_target(instructions[past_merge + 1]) is not None
@@ -1290,9 +1302,14 @@ class Decompiler:
             # the jump is not skipping a clause at all, and the trailing code
             # it lands on must not be absorbed into one.
             skips_clause = body_jump_target in merge_targets
-            if not skips_clause and merge_targets:
+            if self._loop_stack and start >= self._find_target_idx(
+                    instructions, self._loop_stack[-1][1]):
+                skips_clause = True  # post-loop code cannot be this try's else
+            forward_merges = [t for t in merge_targets
+                              if self._match_loop_jump(t) != "continue"]
+            if not skips_clause and forward_merges:
                 first_merge = min(
-                    self._find_target_idx(instructions, t) for t in merge_targets
+                    self._find_target_idx(instructions, t) for t in forward_merges
                 )
                 skips_clause = first_merge <= start
             if start >= scan and not skips_clause:
@@ -1310,6 +1327,13 @@ class Decompiler:
                     limit = self._find_target_idx(instructions, tgt)
                     if start < limit < end:
                         end = limit
+                if self._loop_stack:
+                    loop_exit = self._find_target_idx(instructions, self._loop_stack[-1][1])
+                    if start < loop_exit:
+                        end = min(end, loop_exit)
+                        if (end > start and _jump_target(instructions[end - 1])
+                                == self._loop_stack[-1][0]):
+                            end -= 1  # implicit latch, not part of the else suite
                 for j in range(start, end):
                     op = instructions[j].opname
                     if op in ("RERAISE", "SETUP_FINALLY", "SETUP_EXCEPT"):
@@ -1559,16 +1583,8 @@ class Decompiler:
             # ever got.  Read it there and resume past the handler, which is
             # where 3.9 put the code that follows a ``try``/``finally`` anyway.
             end = self._handler_end(instructions, handler_start_idx)
-            body = self._emit_statements(
-                code, instructions, is_module=False, start=start, end=end,
-                out_stack=[],
-            )
+            body = self._emit_finally_suite(code, instructions, start, end, handler_start_idx)
             self._handled_ranges.append((start, end))
-            while body and (
-                isinstance(body[-1], (ast.Pass, ast.Raise))
-                or _is_bare_return(body[-1])
-            ):
-                body.pop()
             return body, end
         # 3.9 ran the clause inline and then jumped over the handler; the jump
         # is the boundary, and the code after the ``try`` is past the handler.
@@ -1597,10 +1613,7 @@ class Decompiler:
                 resume = None
         if end <= start:
             return [], resume
-        body = self._emit_statements(
-            code, instructions, is_module=False, start=start, end=end,
-            out_stack=[],
-        )
+        body = self._emit_finally_suite(code, instructions, start, end, handler_start_idx)
         # The handler -- and, when a nested ``finally`` unwinds through it, its
         # prologue -- is not source.  Mark it only *after* the inline copy has
         # been read: the prologue range reaches back over the copy, so marking
@@ -1611,13 +1624,21 @@ class Decompiler:
             ),
             self._handler_end(instructions, handler_start_idx),
         ))
-        # The inline copy is followed by the handler's own re-raise, which is
-        # not part of the clause.
-        while body and (
-            isinstance(body[-1], (ast.Pass, ast.Raise)) or _is_bare_return(body[-1])
-        ):
-            body.pop()
+        # RERAISE is ignored by instruction emission. Source-level return and
+        # raise statements in the clause must survive, including bare returns.
         return body, resume
+
+    def _emit_finally_suite(self, code, instructions, start, end, handler_start_idx):
+        previous = self._keep_clause_returns
+        handler_end = self._handler_end(instructions, handler_start_idx)
+        self._keep_clause_returns = previous or (
+            handler_end > handler_start_idx
+            and instructions[handler_end - 1].opname in ("RETURN_VALUE", "RETURN_CONST"))
+        try:
+            return self._emit_statements(
+                code, instructions, is_module=False, start=start, end=end, out_stack=[])
+        finally:
+            self._keep_clause_returns = previous
 
     #: Conditional jumps that keep a ``finally`` copy open: a ``return`` inside
     #: such a branch belongs to the clause, not to whatever follows it.
@@ -1684,7 +1705,11 @@ class Decompiler:
             if h_name == "EXTENDED_ARG":
                 h += 1
                 continue
-            if self._is_exc_drain(instructions, h):
+            drain_end = self._return_exception_drain_end(instructions, h)
+            if drain_end is not None:
+                h = drain_end
+                continue
+            if self._is_exc_drain(instructions, h) and instructions[i].opname != "POP_TOP":
                 while (h < n and instructions[h].opname in
                        ("POP_TOP", "POP_EXCEPT", "END_FINALLY")):
                     h += 1
@@ -1697,6 +1722,24 @@ class Decompiler:
             i += 1
             h += 1
         return min(i, handler_start_idx), False
+
+    @staticmethod
+    def _return_exception_drain_end(instructions, index):
+        """Skip the exception stack below a finally return's pending value."""
+        rotations = ("ROT_TWO", "ROT_THREE", "ROT_FOUR")
+        if instructions[index].opname not in rotations:
+            return None
+        end = index + 1
+        first_pop = end
+        while end < len(instructions) and instructions[end].opname == "POP_TOP":
+            end += 1
+        if end == first_pop:
+            return None
+        if end < len(instructions) and instructions[end].opname in rotations:
+            end += 1
+        if end < len(instructions) and instructions[end].opname == "POP_EXCEPT":
+            return end + 1
+        return None
 
     def _is_exc_drain(self, instructions: List[Instruction], index: int) -> bool:
         """Is ``POP_TOP`` at *index* the head of an exception-stack drain?"""
@@ -2154,7 +2197,7 @@ class Decompiler:
                 i += ifexp_consumed
                 continue
             # Implicit `return None` tail of a function body.
-            if self._is_epilogue_pair(instructions, i, total) \
+            if not self._keep_clause_returns and self._is_epilogue_pair(instructions, i, total) \
                     and (is_module
                          or not self._tail_is_jump_reached(instructions, i)):
                 break
@@ -4713,7 +4756,7 @@ class Decompiler:
                 return None
             expr, guard, merge = chained
             return expr, guard, merge, guard + 1, True
-        guard = self._find_ifexp_condition_jump(instructions, start, end)
+        guard = self._find_ifexp_condition_jump(instructions, start, end, allow_namedexpr=True)
         if guard is None:
             return None
         vals = self._eval_ifexp_expr(code, instructions, start, guard, stack)
@@ -4827,7 +4870,7 @@ class Decompiler:
         guards: List[int] = []
         i = idx
         while i < end:
-            guard = self._find_ifexp_condition_jump(instructions, i, end)
+            guard = self._find_ifexp_condition_jump(instructions, i, end, allow_namedexpr=True)
             if guard is None:
                 break
             vals = self._eval_ifexp_expr(code, instructions, i, guard, stack)
@@ -5562,12 +5605,18 @@ class Decompiler:
         return branch_base + [value], then_kinds | else_kinds
 
     def _find_ifexp_condition_jump(
-        self, instructions: List[Instruction], start: int, end: int
+        self, instructions: List[Instruction], start: int, end: int,
+        *, allow_namedexpr: bool = False,
     ) -> Optional[int]:
         for j in range(start, end):
             op = instructions[j].opname
             if op in ("POP_JUMP_IF_FALSE", "POP_JUMP_IF_TRUE"):
                 return j if j > start else None
+            if (allow_namedexpr and op in self._STORE_OPS and j > start
+                    and instructions[j - 1].opname == "DUP_TOP"
+                    and instructions[j].argval != "__classcell__"):
+                # This store is part of a walrus operand, not a statement.
+                continue
             if op not in self._IFEXP_EXPR_OPS:
                 return None
         return None

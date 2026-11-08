@@ -1174,6 +1174,20 @@ class Decompiler:
         """
         if self._match_loop_jump(merge_target) != "continue":
             return False
+        jump = instructions[past_merge - 1]
+        position = getattr(jump, "positions", None)
+        previous = past_merge - 2
+        while previous >= 0 and instructions[previous].opname in (
+                "POP_EXCEPT", "POP_BLOCK", "EXTENDED_ARG", "NOP"):
+            previous -= 1
+        if (previous >= 0 and getattr(position, "lineno", None) is not None
+                and position == getattr(instructions[previous], "positions", None)
+                and instructions[previous].opname in (
+                    "STORE_FAST", "STORE_NAME", "STORE_GLOBAL", "STORE_DEREF",
+                    "STORE_ATTR", "STORE_SUBSCR", "POP_TOP")):
+            # An implicit handler latch inherits the last statement's span.
+            # A source continue has its own span, even behind POP_EXCEPT.
+            return True
         for region in self._exception_regions(instructions).values():
             if region.kind != KIND_EXCEPT or region.body_end is None:
                 continue
@@ -1469,10 +1483,18 @@ class Decompiler:
                 return []
         bound = self._enclosing_body_end(instructions, try_end_idx, handler_start_idx)
         upper = min(handler_start_idx, bound) if bound is not None else handler_start_idx
+        if self._loop_stack:
+            loop_exit = self._find_target_idx(instructions, self._loop_stack[-1][1])
+            if exit_idx < loop_exit:
+                # An out-of-line handler may sit behind the loop's return.
+                upper = min(upper, loop_exit)
         gap = [k for k in range(try_end_idx + 1, upper)
-               if instructions[k].opname not in self._BLOCK_NOISE]
+               if instructions[k].opname not in self._BLOCK_NOISE
+               or instructions[k].opname == "POP_JUMP_IF_TRUE"]
         if not gap:
             return []
+        gap = sorted(set(gap).union(k for k in range(gap[0], upper)
+                                   if instructions[k].synthetic_loop_exit))
         end = gap[-1] + 1
         # The ``POP_TOP`` that discards an expression statement's value belongs
         # to the statement it closes, so the run right after the last real
@@ -4838,7 +4860,7 @@ class Decompiler:
                 return None
             expr, guard, merge = chained
             return expr, guard, merge, guard + 1, True
-        guard = self._find_ifexp_condition_jump(instructions, start, end)
+        guard = self._find_ifexp_condition_jump(instructions, start, end, allow_namedexpr=True)
         if guard is None:
             return None
         vals = self._eval_ifexp_expr(code, instructions, start, guard, stack)
@@ -4952,7 +4974,7 @@ class Decompiler:
         guards: List[int] = []
         i = idx
         while i < end:
-            guard = self._find_ifexp_condition_jump(instructions, i, end)
+            guard = self._find_ifexp_condition_jump(instructions, i, end, allow_namedexpr=True)
             if guard is None:
                 break
             vals = self._eval_ifexp_expr(code, instructions, i, guard, stack)
@@ -5687,12 +5709,18 @@ class Decompiler:
         return branch_base + [value], then_kinds | else_kinds
 
     def _find_ifexp_condition_jump(
-        self, instructions: List[Instruction], start: int, end: int
+        self, instructions: List[Instruction], start: int, end: int,
+        *, allow_namedexpr: bool = False,
     ) -> Optional[int]:
         for j in range(start, end):
             op = instructions[j].opname
             if op in ("POP_JUMP_IF_FALSE", "POP_JUMP_IF_TRUE"):
                 return j if j > start else None
+            if (allow_namedexpr and op in self._STORE_OPS and j > start
+                    and instructions[j - 1].opname == "DUP_TOP"
+                    and instructions[j].argval != "__classcell__"):
+                # This store is part of a walrus operand, not a statement.
+                continue
             if op not in self._IFEXP_EXPR_OPS:
                 return None
         return None

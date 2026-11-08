@@ -40,6 +40,8 @@ class Instruction:
     line_no: Optional[int] = None
     is_jump_target: bool = False
     synthetic_loop_exit: bool = False
+    # PEP 657 source span, including the copies the compiler threads into exits.
+    positions: Any = None
 
     def __str__(self):
         parts = []
