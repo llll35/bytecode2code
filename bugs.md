@@ -1,8 +1,224 @@
 # 项目缺陷清单（bugs.md）
 
-> 最后更新：2026-11-08。状态含义：
+> 最后更新：2026-11-13。状态含义：
 > **已修复** / **部分修复** / **未修复** / **不适用**。
 > 复现与验证命令见文末。
+
+---
+
+## 2026-11-13 tripwire.py 嵌套模式与 guard 决策图（AI）
+
+**状态：新增压力样例触发的错误已修复。** 新增独立 `tripwire.py`，包含
+14 个模式匹配压力用例与 2 个普通语法对照。源码、递归 code-object 和实际
+行为三项必须同时通过；没有修改旧 `nightmare.py`、`tests/equivalence.py`
+或用户的 `prepare.py`，也没有按函数名修补输出。
+
+修复前七版本 **20/98** 通过，其中 **48** 个版本/用例组合有实际行为差异，
+不只是源码形状不同。修复后同一份脚本 **98/98** 通过，**2309** 组行为
+场景一致。基线报告保存了 reader 与脚本的 SHA-256；修复前后脚本哈希相同。
+
+| 版本 | 修复前 | 修复后 | 行为场景 |
+|------|--------|--------|----------|
+| 3.9 | 2/2 | **2/2** | 11 |
+| 3.10–3.15 | 各 3/16 | **各 16/16** | 各 383 |
+
+3.9 不支持 match，明确跳过 14 个模式用例，只运行普通多行 if 与 finally
+返回的对照。脚本按版本启动子进程，提供单版本/单用例选择、JSON 报告、
+180 秒超时及有界事件记录，不执行网络操作或修改用户文件。
+
+根因与修复（只改 3.10–3.15 各自的 `pattern_match.py`，按方法锚点移植）：
+
+- **解包后并不立即绑定。** `[first, [second, *tail]]`、class 字段中的
+  字面量及 mapping 内的 sequence 会先测试，再通过 COPY/SWAP/ROT 排列
+  待绑定值。旧 reader 只接受连续 STORE，或仅凭 STORE 顺序猜 mapping
+  绑定，因此退化为普通 if，丢失捕获变量。现在用有身份的模式 slot 跟踪
+  成功路径的真实栈；子模式与捕获绑定到同一个字段，空序列也正确恢复。
+- **rest 不是普通捕获。** 3.10 的 `COPY_DICT_WITHOUT_KEYS` 与后续版本的
+  BUILD_MAP/DICT_UPDATE/DELETE_SUBSCR 使用不同布局。现在分别模拟两种
+  布局，并验证删除的 keys 与所属 mapping 一致，保留正确的 `**rest`。
+- **混合 guard 需要内部边。** `a and (b or c)`、`a or (b and c)` 不满足
+  所有跳转只指向成功/失败两端的平面假设。现在构造 forward 决策图，按
+  and/or 子图分解；保持操作数、单项 not 与真值测试顺序，不用可能重复
+  调用 `__bool__` 的展开公式。失败边必须到达同一下一 case；case body
+  自己的 if 不能并入 guard。循环与不能安全分解的图拒绝猜测。
+- **行变化不等于语法边界。** 多行 subject 的参数与多行 guard 原先被
+  截断；同一行的 case body 又被当成 guard。subject 现在只在表达式区间
+  内寻找完整单值与模式入口，每次候选都隔离状态，不能跨越普通语句。
+  guard 使用分支与失败清理边界，而不是只读一行。
+- **捕获/通配 case 也可带 guard。** `case n if gate(n)` 不再变成普通赋值；
+  failure cleanup 只跳过属于当前模式的 POP_TOP，不吞掉下一通配 case
+  的 subject discard。没有测试的最终捕获 case 保留名字与 body。
+
+行为夹具覆盖真/假/抛异常的 `__bool__`、subject 只调用一次、class 属性读取
+顺序、AttributeError 与 ValueError 的区别、sequence/mapping 访问、部分
+嵌套模式失败后的下一 case、as 绑定的对象身份，以及 break/continue/异常
+穿过 finally 时的清理顺序与异常链。
+
+新增 `tests/test_tripwire_regression.py`：七版本 **44/44** 适用测试通过，
+5 项在 3.9 跳过。旧 nightmare 回归仍为 **118/118**，共 **162/162**
+适用单测通过。原门禁保持 ROUND-TRIP **263/263**、CONTROL FLOW
+**77/77**、组合控制流 **18/18**、CRASH **56/56**；旧 `nightmare.py`
+仍为 **82/94**，原有 12 项信息丢失导致的 AST 差异未改变。
+本节不宣称支持任意嵌套 OR 模式、任意 guard 表达式或所有 match/异常组合。
+
+记录：`_scratch/tripwire_before.json`、`_scratch/tripwire_after.json`、
+`_scratch/tripwire_regression.json`、`_scratch/tripwire_gate_after.txt`、
+`_scratch/tripwire_nightmare_after.txt`。
+
+```powershell
+python tripwire.py
+python tripwire.py --version 3.14 --case mapping_nested --verbose
+python tripwire.py --json tripwire-results.json
+.\embed_python\python-3.14\python.exe tests/test_tripwire_regression.py
+python tests/run.py
+```
+
+---
+
+## 2026-11-09 nightmare.py 条件退出与模式匹配（AH）
+
+**状态：当前压力样例的可恢复错误已修复，严格源码形状仍有信息限制。**
+接续上一批 **57/94**，现在严格 AST 与现有递归 code-object 双重门禁为
+**82/94**；单看原有 code-object 比较规则，已达到 **94/94**。
+`nightmare.py`、`tests/equivalence.py` 和用户的 `prepare.py` 均未改动，
+没有通过改样例、放宽比较或按函数名猜源码取绿。
+
+| 版本 | 本批前 | 当前严格压力样例 |
+|------|--------|------------------|
+| 3.9 | 4/8 | **5/8** |
+| 3.10 | 3/11 | **7/11** |
+| 3.11 | 10/15 | **14/15** |
+| 3.12 | 10/15 | **14/15** |
+| 3.13 | 10/15 | **14/15** |
+| 3.14 | 10/15 | **14/15** |
+| 3.15 | 10/15 | **14/15** |
+
+本批修复：
+
+- **条件 break 的两条边。** 异常表只保护条件测试，结束于 break 的 finally
+  副本之前；条件不成立时仍需在合流点关闭 except 块。3.11–3.15 根据 guard
+  目标与源码行补齐正常边的 close，并在对应的 finally 副本前关闭外层块，
+  不把条件体截成 pass 或编造 try-else。3.14/3.15 的 except 合流回到正常
+  finally 副本时不再将它和自然循环回边当作函数尾部搬走。
+- **while 的返回副本。** 3.10–3.15 把退出路径上的完整 load/return 对还原为
+  跳转，保存一份位于循环之后的返回。源行与可用列信息必须表明它在 finally
+  之后；循环的 out-of-line except handler 同样参与副本归属。返回值在所有
+  finally 执行完后才取，避免 `i += 1` 后仍返回旧 i。
+- **保留 finally 自己的条件 return。** 3.11–3.15 在副本匹配时跨过
+  rotation/pop/POP_EXCEPT 异常 drain，不能把真实 RETURN_VALUE 切掉。
+  负向回归保留循环内及 finally 内的源级 return，不一概改成 break。
+- **3.9 的 else 与自然 latch。** 该版仍保留 `while True ... else` 的指令，
+  现在读取回边与 break 出口之间已排除 handler 的区间。嵌套 finally 的
+  merge 被线程化到循环 latch 时，用源行标记区分真实 continue，去掉会
+  错误吞掉清理异常的伪 continue。except-as 样例现仅剩无 break 的 for-else
+  源码形状差异。
+- **match reader。** 3.10–3.15 各自新增独立 `pattern_match.py`，先读取原始
+  模式 dispatch，再交给普通表达式 reader；恢复字面量、单例、同一 case 的
+  OR 分支、mapping/rest、class 字段及 as 捕获、sequence/star 和 guard。
+  guard 的 and/or 保留短路顺序；合并 fast 指令上的 guard 从真正的 load
+  而非同地址 store 开始。3.15 的 None 公共常量也保留显式 return None。
+  三个 `match_*` 压力样例在六版本 **18/18** 通过；本节不宣称已支持所有
+  嵌套模式或任意模式/异常区域组合。
+
+`tests/test_nightmare_regression.py` 从 8 项扩为 **20 项**，七版本
+**118/118** 适用测试通过，另 **22** 项按版本跳过。新增 AST/code-object、
+条件的真/假/异常边、finally 求值顺序与异常不被 continue 吞掉、match subject
+只求值一次、guard 短路、循环 break/continue、不同缩进和不可区分源码的验证。
+旧门禁保持 ROUND-TRIP **263/263**、CONTROL FLOW **77/77**、组合控制流
+**18/18**、CRASH **56/56**，`main.py selftest` **2/2**。
+
+剩余 **12** 项仅报 `source AST differs`，不再有该压力样例的 code-object 差异：
+
+- **6** 项：3.10–3.15 的 `while_true_try_finally` 中 `else: print('never')`
+  被编译器删除。测试直接把这份原样例的 never 换成同长度的 other，证明
+  两份 AST 不同，而指令、常量及行表相同；不能从字节码确定缺失的文本。
+- **4** 项：3.9/3.10 的 `for_else_trailing_finally` 与
+  `except_as_nested_finally` 没有 break，for-else 与普通循环后续语句具有
+  相同字节码；旧版没有列信息。对齐源码行号后行表也完全相同。
+- **2** 项：3.9/3.10 的 `generator_finally` 中裸 return 与 return None
+  无列信息可区分，返回和生成器 close/throw 行为仍保持一致。
+
+因此 `python nightmare.py` 仍按用户的严格规则退出 1，不将信息丢失伪报成全绿。
+记录：`_scratch/nightmare_after18.txt`、`_scratch/nightmare_gate_after18.txt`、
+`_scratch/nightmare_regression18.json` 及逐版本回归日志。
+
+```powershell
+python nightmare.py
+python tests/run.py
+.\embed_python\python-3.14\python.exe tests/test_nightmare_regression.py
+```
+
+---
+
+## 2026-11-08 nightmare.py 压力样例修复（AG）
+
+**状态：部分修复。** 保留用户的 `nightmare.py` 及其 AST、递归 code object
+比较规则不变，未改动用户的 `prepare.py`。七个后端按锚点分别修改，未整文件复制。
+本次继续工作前为 **30/94**，收尾为 **57/94**；包含前一批 nested-with 修复的
+累计结果由最初的 **21/94** 提升到 **57/94**。
+
+| 版本 | 本次继续前 | 当前压力样例 |
+|------|------------|--------------|
+| 3.9 | 3/8 | **4/8** |
+| 3.10 | 3/11 | **3/11** |
+| 3.11 | 6/15 | **10/15** |
+| 3.12 | 6/15 | **10/15** |
+| 3.13 | 6/15 | **10/15** |
+| 3.14 | 3/15 | **10/15** |
+| 3.15 | 3/15 | **10/15** |
+
+已验证的根因与修法：
+
+- **嵌套 with 的源码形状及重复退出。** 同行的管理器才合并成多管理器 with，
+  不同行保留真实嵌套；3.9/3.10 使用继承行号，3.11+ 使用 positions。
+  嵌套 handler 的返回副本从正常路径的 return 追溯匹配，3.14/3.15 的
+  `POP_EXCEPT` 后清理接受额外的 POP_TOP。`nested_with` 七版本全部通过。
+- **合并指令上的 with 入口。** 3.13–3.15 的异常保护区可以起于
+  `STORE_FAST_LOAD_FAST`。偏移查找原先取展开后的最后一条 load，遗漏它前面的
+  enter 调用，将外层 with 误认为 try。`_analyse_with` 现在取同偏移的第一条
+  store，局部变量作为多个上下文管理器的回归也通过。
+- **finally 副本匹配与延迟 return。** 3.9/3.10 的副本匹配及 3.14/3.15 的
+  inline 边界不再只比较 opcode，常量和名字必须相同，重定位的跳转参数才豁免。
+  内层已恢复 return 时，外层不重复发射延迟的 RETURN_VALUE；3.9 的已消费
+  finally prologue 跳转也不作为显式 return 的证据。`deep_finally` 七版本通过。
+- **没有 break 的 for-else。** 3.14/3.15 结合绑定的列偏移与原始 NOP 的位置
+  恢复 else 边界，不把后面的 try 或另一个 for 吞进去。常量 return 的表达式
+  位置与语句缩进分开。`for_else_trailing_finally`、`except_as_nested_finally`
+  在 3.11–3.15 全部通过。
+- **生成器的异常退出被当作隐式尾声。** 3.10 的 copied-return shim 不再删除
+  循环 handler 的真实退出；3.12+ 根据 iterator pop 和异常表的循环入口保留
+  out-of-line handler 的 None return。3.15 同时跨过 iterator 与缓存 next callable
+  的清理。3.11+ 用 POP_EXCEPT 的六列 return span 分辨裸 return 和 return None，
+  不根据函数名猜源码。`generator_finally` 在 3.11–3.15 全部通过。
+- **except-star 的匹配、重组、成功子句与尾部。** 3.14/3.15 接通子组匹配的
+  reader、`ast.TryStar` 和 CFG 分类；编译器的 subgroup merge 不被当作循环或
+  源级 return。重排时同步 `END_EXCEPT_STAR_CHAIN` 的地址，同一原始尾段只在
+  最后一个 merge 点发射一次。finally 从 handler 副本恢复，但继续读取真正的
+  后续语句；只有 opcode 前缀相同不能把 `append('after')` 当成 finally 副本。
+  源码 NOP 与 handler 列位置决定是否合并 TryStar 的 finally wrapper，显式
+  嵌套 try 保持嵌套。四个 `except_star_*` 压力样例在五版本 **20/20** 通过。
+
+新增独立 `tests/test_nightmare_regression.py`：七版本 **45/45** 适用测试通过，
+另有 **11** 项按语法或元信息版本跳过；包括 AST、递归 code object、生成器
+close/throw、混合 ExceptionGroup、else/finally/后续语句副作用和真实 try 嵌套。
+旧门禁仍为 ROUND-TRIP **263/263**、CONTROL FLOW **77/77**、组合控制流
+**18/18**、CRASH **56/56**。本批完整记录：`_scratch/nightmare_after14.txt`、
+`_scratch/nightmare_gate_after14.txt`。
+
+剩余 **37** 项未通过，不宣称压力样例全绿：
+
+- `match_*`（3.10–3.15）尚无模式 reader，仍恢复成错误的 if/赋值。
+- 条件 break、while True 与嵌套 try/finally 的退出边界仍有真实控制流缺陷。
+- 3.9 的 `except_as_nested_finally` 仍多发 continue。
+- 3.9/3.10 无 break 的 else 和裸 return / return None 存在源码形状不可判
+  的 AST 差异；3.10 的 except-as 样例现在只剩该 else 差异。未靠猜输出消除。
+  编译器删除的 `while True ... else` 内容同样不能从不存在的指令中恢复。
+
+```powershell
+python nightmare.py
+python tests/run.py
+.\embed_python\python-3.14\python.exe tests/test_nightmare_regression.py
+```
 
 ---
 

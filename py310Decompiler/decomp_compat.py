@@ -12,6 +12,7 @@ without touching the original package.
 """
 
 import ast
+from dataclasses import replace
 from typing import Any, List, Optional, Tuple
 
 from .decompiler import Decompiler as _BaseDecompiler
@@ -27,6 +28,78 @@ class Decompiler310(_BaseDecompiler):
     #: every ``except`` handler instead of sharing one tail.  ``decomp311``
     #: clears the flag because its rewriter already drops those copies.
     _copied_none_return = True
+
+    def _hoist_stray_block_tails(self, instructions):
+        return super()._hoist_stray_block_tails(
+            self._restore_threaded_while_returns(instructions))
+
+    def _restore_threaded_while_returns(self, instructions):
+        """Put a post-loop return back behind the breaks it was copied into.
+
+        A return evaluated after the last finally suite is not a return from
+        inside that suite: moving its load ahead of cleanup changes the value.
+        Only complete load/return pairs on a later source line qualify; column
+        metadata, when present, must also place the return outside the body.
+        The handler copies count as part of the loop even when laid out after
+        its normal latch. Keep one continuation and restore jumps to it.
+        """
+        out = list(instructions)
+        lines, line = [], None
+        for ins in out:
+            line = getattr(getattr(ins, 'positions', None), 'lineno', None) or ins.line_no or line
+            lines.append(line)
+        removed, tails = set(), []
+        next_offset = max((ins.offset for ins in out), default=0) + 2
+        for latch, back in enumerate(instructions):
+            if (back.opname not in _JUMP_OPS or not isinstance(back.argval, int)
+                    or back.argval >= back.offset):
+                continue
+            head = self._find_target_idx(instructions, back.argval)
+            if head >= latch or instructions[head].opname not in ('NOP', 'SETUP_FINALLY'):
+                continue
+            handlers = self._block_handlers(instructions, head, latch)
+            if not handlers:
+                continue
+            stop = max([latch + 1] + [self._handler_end(instructions, h) for h in handlers])
+            pairs = [(i - 1, i) for i in range(head + 1, stop)
+                     if i not in removed and out[i].opname == 'RETURN_VALUE'
+                     and out[i - 1].opname in ('LOAD_FAST', 'LOAD_CONST')
+                     and lines[i - 1] == lines[i] and lines[i] is not None]
+            excluded = {i for first, last in pairs for i in (first, last)} | removed
+            excluded.update(i for i in range(head, stop)
+                            if getattr(out[i], 'synthetic_loop_exit', False))
+            body_lines = [lines[i] for i in range(head, stop)
+                          if i not in excluded and lines[i] is not None]
+            columns = [getattr(getattr(out[i], 'positions', None), 'col_offset', None)
+                       for i in range(head, stop) if i not in excluded]
+            columns = [column for column in columns if column is not None]
+            if not body_lines:
+                continue
+            candidates = [(a, b) for a, b in pairs if lines[a] > max(body_lines)
+                          and (not columns or getattr(out[b].positions, 'col_offset', None) is not None
+                               and out[b].positions.col_offset < min(columns))]
+            if not candidates:
+                continue
+            first, last = candidates[0]
+            copies = [(a, b) for a, b in candidates if lines[a] == lines[first]
+                      and out[a].opname == out[first].opname and out[a].argval == out[first].argval]
+            if not any(a < latch or any(ins.opname in _JUMP_OPS and ins.argval == out[a].offset
+                                       for ins in out[head:latch]) for a, _ in copies):
+                continue
+            tail = next_offset
+            next_offset += 4
+            tails.extend((replace(out[first], offset=tail), replace(out[last], offset=tail + 2)))
+            starts = {out[a].offset for a, _ in copies}
+            for a, b in copies:
+                out[a] = replace(out[a], opname='JUMP_FORWARD', opcode=back.opcode,
+                                 arg=tail, argval=tail)
+                if hasattr(out[a], 'synthetic_loop_exit'):
+                    out[a].synthetic_loop_exit = True
+                removed.add(b)
+            for i, ins in enumerate(out):
+                if ins.opname in _JUMP_OPS and ins.argval in starts:
+                    out[i] = replace(ins, argval=tail)
+        return [ins for i, ins in enumerate(out) if i not in removed] + tails
 
     def _process_instruction(self, instr, instructions, idx, code, stack, stmts,
                              is_module=False, limit=None):
@@ -97,7 +170,9 @@ class Decompiler310(_BaseDecompiler):
             code, instructions, body_start, as_setup_target, as_setup_idx,
             fallback_reraise_idx,
         )
-        if not self._copied_none_return:
+        if not self._copied_none_return or self._loop_stack:
+            # A handler still inside a loop cannot fall through to the
+            # function epilogue. Its return leaves the loop explicitly.
             return body, post
         return self._drop_copied_return(body), post
 

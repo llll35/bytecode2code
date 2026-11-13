@@ -28,7 +28,7 @@ import dis
 import sys
 import ast
 from bisect import bisect_right
-from .disassembler import Instruction
+from .disassembler import Instruction, _line_of
 from .decompiler import _is_bare_return
 
 from .decomp_compat import Decompiler310
@@ -897,6 +897,11 @@ class Rewriter(object):
                 if target < entry.end:
                     # This is a real loop continue, not a duplicated tail.
                     break
+                handlers = set(self._try_handlers(entry)) - {entry.target}
+                if any(handlers.intersection(owners) and target >= close
+                       and self._conditional_body_ends.get(entry.target) == close
+                       for close, owners in getattr(self, '_pre_closes', {}).items()):
+                    break
                 # The code the handler jumps back to is the code that follows
                 # the whole ``try`` statement.  3.11/3.12 place it before the
                 # handler, where the reader would take it for the ``else``
@@ -923,6 +928,8 @@ class Rewriter(object):
             head = by_offset.get(entry.start)
             end = by_offset.get(entry.end)
             if handler is None or head is None or end is None:
+                continue
+            if entry.target in getattr(self, '_conditional_body_ends', {}):
                 continue
             loop_heads = set()
             for raw in raw_list[handler:]:
@@ -1009,6 +1016,27 @@ class Rewriter(object):
                 self.jump_targets.add(self.raw[tail].offset)
                 self._drops.update(raw.offset for raw in self.raw[start + 1:end + 1])
                 break
+
+    def _coalesce_group_tails(self, tails):
+        """Emit a shared continuation once, after its last subgroup handler."""
+        merges = {finish for _, _, finish in getattr(self, '_exception_group_exits', ())}
+        result, shared = dict(tails), {}
+        for point, tail in tails.items():
+            if point not in merges:
+                continue
+            offsets = tuple(ins.offset for ins in tail if ins.offset not in self._drops
+                            or ins.offset in getattr(self, '_tail_offsets', ()))
+            if not offsets:
+                continue
+            previous = shared.get(offsets)
+            if previous is None:
+                shared[offsets] = point
+            elif point > previous:
+                result.pop(previous, None)
+                shared[offsets] = point
+            else:
+                result.pop(point, None)
+        return result
 
     def _save_tail_for_merge(self, tail_start, merge_offset):
         """Save tail instructions to be emitted at the merge point.
@@ -1306,7 +1334,11 @@ class Rewriter(object):
         last of them ends.  Entries that end at or after the handler itself
         cover the re-raise tail rather than the body and are left out.
         """
-        by_offset = {raw.offset: n for n, raw in enumerate(self.raw)}
+        by_offset = {}
+        for n, raw in enumerate(self.raw):
+            # An exception range can start on STORE_FAST_LOAD_FAST. The
+            # expanded store is the body's first instruction, not its load.
+            by_offset.setdefault(raw.offset, n)
         setups = {}
         closes = {}
         targets = set()
@@ -1315,6 +1347,8 @@ class Rewriter(object):
         exits = set()
         self.async_with_setups = {}
         self.with_anchors = {}
+        self._with_handler_markers = set()
+        self._with_close_owner = {}
         for entry in _exception_entries(self.code):
             start = by_offset.get(entry.start)
             if start is None or start == 0:
@@ -1331,6 +1365,7 @@ class Rewriter(object):
                 continue
             anchor = self.raw[setup]
             setups[anchor.offset] = self.raw[handler + 1].offset
+            self._with_handler_markers.add(self.raw[handler + 1].offset)
             if anchor.opname == 'COPY':
                 # 3.15 spells the prefix out instead of a single
                 # ``BEFORE_WITH``: ``COPY``, the two special lookups, two
@@ -1386,9 +1421,10 @@ class Rewriter(object):
             position = by_offset.get(end)
             if position is None:
                 continue
-            resolved.append((end, position))
-        for end, position in sorted(resolved):
+            resolved.append((end, position, self.raw[by_offset[target] + 1].offset))
+        for end, position, owner in sorted(resolved):
             closes[end] = end
+            self._with_close_owner[end] = owner
             if self.raw[position].opname == 'SWAP':
                 swaps.add(end)
             exit_call = self._find_exit_call(position)
@@ -1606,7 +1642,19 @@ class Rewriter(object):
                 tail.append(opname)
                 index += 1
                 continue
-            if tail[-4:] == ['POP_TOP', 'POP_EXCEPT', 'POP_TOP', 'POP_TOP']:
+            # The handler ends with ``POP_TOP; POP_EXCEPT`` and then only
+            # ``POP_TOP``s.  3.14 keeps one more stack slot alive than 3.13,
+            # so the run behind ``POP_EXCEPT`` is longer; counting a fixed
+            # four misses it.
+            recent = tail[-8:]
+            done = False
+            if 'POP_EXCEPT' in recent:
+                pop_except = len(recent) - 1 - recent[::-1].index('POP_EXCEPT')
+                done = (pop_except > 0 and pop_except < len(recent) - 1
+                        and recent[pop_except - 1] == 'POP_TOP'
+                        and all(op == 'POP_TOP'
+                                for op in recent[pop_except + 1:]))
+            if done:
                 # The handler ends here: the pops are its last act and the
                 # code behind them belongs to the block's surroundings.
                 self._drops.update(
@@ -1649,7 +1697,20 @@ class Rewriter(object):
         if index < 0 or raw_list[index].opname not in (
             'RETURN_VALUE', 'RETURN_CONST'
         ):
-            return None
+            # Nested ``with`` handlers are laid out back to back, so the
+            # statement the block's normal path ends with is not directly in
+            # front of every handler: only the innermost one follows it.  For
+            # the outer handlers, walk back to the return the first handler of
+            # the chain follows -- that is the run the compiler copied.
+            index = handler - 1
+            while index >= 0:
+                if (raw_list[index].opname in ('RETURN_VALUE', 'RETURN_CONST')
+                        and index + 1 < len(raw_list)
+                        and raw_list[index + 1].opname == 'PUSH_EXC_INFO'):
+                    break
+                index -= 1
+            if index < 0:
+                return None
         run = [index]
         index -= 1
         while index >= 0 and len(run) < 8:
@@ -1785,10 +1846,27 @@ class Rewriter(object):
                 self.empty_body_setups.add((start_off, entry.start))
                 break
         setups = self._place_block_setups(entries, blocks)
+        self.try_setups = setups
         self.try_closes = closes
         self._analyse_handlers()
         self._redirect_handler_epilogues()
         self._place_block_closes(setups, closes)
+        for head, normal_pop, _ in self._exception_group_exits:
+            group_entry = next(entry for entry in entries if entry.target == head)
+            enclosing = set(self._try_handlers(group_entry)) - {head}
+            for anchor, owner in list(self._close_owner.items()):
+                if owner not in enclosing or not head <= anchor < owner or anchor not in closes:
+                    continue
+                end = closes.pop(anchor)
+                self._close_owner.pop(anchor, None)
+                extras = self.close_extras.pop(anchor, 0)
+                if normal_pop in closes:
+                    self.close_extras[normal_pop] = self.close_extras.get(normal_pop, 0) + extras + 1
+                else:
+                    closes[normal_pop] = end
+                    self._close_owner[normal_pop] = owner
+                    if extras:
+                        self.close_extras[normal_pop] = extras
         for end, target in self.name_closes.items():
             closes[end] = target
         return setups, closes
@@ -1900,6 +1978,13 @@ class Rewriter(object):
             for entry in entries:
                 if entry.target == target or entry.start >= begins:
                     continue
+                if (entry.target < begins and self._is_exception_group_target(entry.target)
+                        and self._handler_reaches(entries, entry.target, target)):
+                    # Subgroup recombination has unprotected gaps. Its
+                    # enclosing finally can start after the group handler,
+                    # but the table's protection chain still proves ancestry.
+                    begins = entry.start
+                    break
                 if not begins <= entry.target < target:
                     continue
                 if entry.end == begins or (entry.target in heads
@@ -1911,6 +1996,17 @@ class Rewriter(object):
                     break
             else:
                 return begins
+
+    def _is_exception_group_target(self, target):
+        index = self._offset_index(target)
+        if index is None or self.raw[index].opname != 'PUSH_EXC_INFO':
+            return False
+        for raw in self.raw[index + 1:]:
+            if raw.opname == 'CHECK_EG_MATCH':
+                return True
+            if raw.opname not in ('COPY', 'SWAP', 'BUILD_LIST', 'EXTENDED_ARG') and raw.opname not in self._TYPE_LOADS:
+                break
+        return False
 
     def _handler_reaches(self, entries, handler, target):
         """Whether a handler's exception-table protection chain reaches target."""
@@ -1984,8 +2080,70 @@ class Rewriter(object):
                                       closes)
         self._share_body_close(entries, setups, raw_list, closes)
         self._place_exit_closes(entries, raw_list, closes)
+        self._restore_conditional_body_closes(entries, setups, closes)
         for key in [k for k in closes if k in self.with_closes]:
             del closes[key]
+
+    def _restore_conditional_body_closes(self, entries, setups, closes):
+        """Close a guarded escape on both edges of its final condition.
+
+        The table ends before the escaping branch's finally copies. The
+        condition's other edge still reaches the end of the try body, often
+        as a NOP or a merge jump with no exception-table entry of its own.
+        Using only the first close cuts off the if body and invents an else.
+        """
+        raw = self.raw
+        by_offset = {ins.offset: i for i, ins in enumerate(raw)}
+        self._conditional_body_ends = {}
+        self._pre_closes = getattr(self, '_pre_closes', {})
+        for begins, targets in setups.items():
+            inner = targets[-1]
+            handler = by_offset[inner]
+            if self._is_finally_handler(raw, handler):
+                continue
+            spans = [e for e in entries if e.target == inner and e.start < inner]
+            if not spans:
+                continue
+            end = max(e.end for e in spans)
+            if end not in by_offset:
+                continue
+            for guard in raw[by_offset[begins]:by_offset[end]]:
+                if (not guard.opname.startswith('POP_JUMP') or not isinstance(guard.argval, int)
+                        or not end < guard.argval < inner or guard.argval not in by_offset):
+                    continue
+                landing = by_offset[guard.argval]
+                normal = raw[landing]
+                if (normal.opname not in ('NOP', 'JUMP_FORWARD', 'JUMP_BACKWARD')
+                        or normal.positions.lineno != guard.positions.lineno):
+                    continue
+                if not any(ins.opname in ('RETURN_VALUE', 'RETURN_CONST', 'JUMP_FORWARD')
+                           for ins in raw[by_offset[end]:landing]):
+                    continue
+                self._conditional_body_ends[inner] = guard.argval
+                owners = self._pre_closes.setdefault(guard.argval, [])
+                if inner not in owners:
+                    owners.append(inner)
+                continuation = landing + 1 if normal.opname == 'NOP' else by_offset.get(normal.argval)
+                if continuation is None:
+                    break
+                while continuation < len(raw) and raw[continuation].opname in ('NOP', 'EXTENDED_ARG'):
+                    continuation += 1
+                for outer in reversed(targets[:-1]):
+                    clause = self._clause_shape(raw, by_offset[outer])
+                    if not clause or continuation + len(clause) > len(raw):
+                        continue
+                    if not all(ins.opname == op and ins.argval == value for ins, (op, value)
+                               in zip(raw[continuation:continuation + len(clause)], clause)):
+                        continue
+                    for anchor in list(closes):
+                        if self._close_owner.get(anchor) == outer and anchor < guard.argval:
+                            del closes[anchor]
+                            self._close_owner.pop(anchor, None)
+                    close_at = guard.argval if normal.opname == 'NOP' else raw[continuation].offset
+                    owners = self._pre_closes.setdefault(close_at, [])
+                    if outer not in owners:
+                        owners.append(outer)
+                break
 
     def _share_body_close(self, entries, setups, raw_list, closes):
         """Pop every block of one statement at the end of its body.
@@ -2004,6 +2162,8 @@ class Rewriter(object):
             if len(targets) < 2:
                 continue
             inner = targets[-1]
+            if inner in getattr(self, '_exception_group_heads', ()):
+                continue
             anchor = next((offset for offset, owner
                            in self._close_owner.items() if owner == inner),
                           None)
@@ -2156,6 +2316,14 @@ class Rewriter(object):
         for start in range(1, h_idx - width + 1):
             if raw_list[start].offset < region_end:
                 continue
+            # Equal instructions on different source lines are separate suites,
+            # not copies made while unwinding this particular finally block.
+            original = getattr(raw_list[h_idx + 1], 'positions', None)
+            candidate = getattr(raw_list[start], 'positions', None)
+            if (original is not None and original.lineno is not None
+                    and candidate is not None and candidate.lineno is not None
+                    and original != candidate):
+                continue
             if all(raw_list[start + k].opname == clause[k][0]
                    and raw_list[start + k].argval == clause[k][1]
                    for k in range(width)):
@@ -2264,6 +2432,109 @@ class Rewriter(object):
             j += 1
         return False
 
+    def _rewrite_exception_group(self, head):
+        """Expose except-star suites without subgroup split/merge machinery."""
+        raw = self.raw
+        entries = _exception_entries(self.code)
+        by_offset = {ins.offset: i for i, ins in enumerate(raw)}
+        index = by_offset[head] + 1
+        while index < len(raw) and raw[index].opname in ('COPY', 'SWAP', 'BUILD_LIST'):
+            index += 1
+        clauses, prefix = [], by_offset[head]
+        while index < len(raw):
+            type_start = check = index
+            while check < len(raw) and raw[check].opname in self._TYPE_LOADS:
+                check += 1
+            if check >= len(raw) or raw[check].opname != 'CHECK_EG_MATCH':
+                return False
+            dispatch = check + 1
+            while dispatch < len(raw) and raw[dispatch].opname in ('COPY', 'EXTENDED_ARG'):
+                dispatch += 1
+            if dispatch >= len(raw) or 'IF_NONE' not in raw[dispatch].opname:
+                return False
+            no_match = by_offset.get(raw[dispatch].argval)
+            if no_match is None or no_match <= dispatch:
+                return False
+            bind = dispatch + 1
+            name = raw[bind].argval if raw[bind].opname in _STORE_OPS else None
+            body = bind + 1
+
+            def collector(offset):
+                start = by_offset.get(offset)
+                if start is None:
+                    return False
+                run = raw[start:start + (4 if name is not None else 1)]
+                if name is not None:
+                    if (len(run) != 4 or run[0].opname != 'LOAD_CONST' or run[0].argval is not None
+                            or run[1].opname not in _STORE_OPS or run[1].argval != name
+                            or not run[2].opname.startswith('DELETE_') or run[2].argval != name):
+                        return False
+                return run[-1].opname == 'LIST_APPEND' and run[-1].arg == 3
+
+            spans = [entry for entry in entries if raw[body].offset <= entry.start < raw[no_match].offset
+                     and entry.end <= raw[no_match].offset and collector(entry.target)]
+            if spans:
+                body_end = by_offset[max(entry.end for entry in spans)]
+            else:
+                body_end = body
+                while body_end < no_match and raw[body_end].opname in ('NOP', 'EXTENDED_ARG'):
+                    body_end += 1
+            if not body <= body_end <= no_match:
+                return False
+            clauses.append((prefix, type_start, check, dispatch, bind, body, body_end, no_match, name))
+            index = no_match + 1
+            if index < len(raw) and raw[index].opname in self._TYPE_LOADS:
+                prefix = no_match
+                continue
+            break
+        prep = index
+        while prep < len(raw) and raw[prep].opname in ('LIST_APPEND', 'EXTENDED_ARG'):
+            prep += 1
+        if prep >= len(raw) or not (raw[prep].opname == 'PREP_RERAISE_STAR'
+                                   or raw[prep].opname == 'CALL_INTRINSIC_2' and raw[prep].arg == 1):
+            return False
+        normal_pop = prep + 1
+        while normal_pop < len(raw) and raw[normal_pop].opname != 'POP_EXCEPT':
+            normal_pop += 1
+        if normal_pop + 1 >= len(raw):
+            return False
+        exit_index = normal_pop + 1
+        cleanup = [entry.target for entry in entries if entry.start <= head < entry.end and entry.lasti]
+        chain_end = min(cleanup) if cleanup else raw[exit_index].offset + 2
+        after_cleanup = by_offset.get(chain_end, exit_index + 1)
+        while after_cleanup < len(raw) and raw[after_cleanup].opname in ('COPY', 'POP_EXCEPT', 'RERAISE'):
+            after_cleanup += 1
+        finish = raw[after_cleanup].offset if after_cleanup < len(raw) else chain_end + 6
+        self._exception_group_exits.append((head, raw[normal_pop].offset, finish))
+        for prefix, type_start, check, dispatch, bind, body, body_end, no_match, name in clauses:
+            self._drops.update(ins.offset for ins in raw[prefix:type_start])
+            self.try_replace[raw[prefix].offset] = [('DUP_TOP', None, head)]
+            self._drops.discard(raw[prefix].offset)
+            self.try_replace[raw[check].offset] = [('JUMP_IF_NOT_EG_MATCH', None, raw[no_match].offset)]
+            self._drops.update(ins.offset for ins in raw[check + 1:bind])
+            self.try_replace[raw[bind].offset] = (
+                [('POP_TOP', None, None), (raw[bind].opname, raw[bind].arg, name), ('POP_TOP', None, None)]
+                if name is not None else [('POP_TOP', None, None)] * 3)
+            self._drops.update(ins.offset for ins in raw[body_end:no_match])
+            self.try_replace[raw[body_end].offset] = [('END_EXCEPT_STAR_BODY', None, head)]
+            self._drops.discard(raw[body_end].offset)
+        last = clauses[-1][7]
+        self.try_replace[raw[last].offset] = [('END_EXCEPT_STAR_CHAIN', None, raw[normal_pop].offset)]
+        self._drops.discard(raw[last].offset)
+        self._drops.update(ins.offset for ins in raw[last + 1:normal_pop])
+        self._drops.update(ins.offset for ins in raw[exit_index + 1:after_cleanup])
+        exit_jump = raw[exit_index]
+        if exit_jump.opname in _JUMP_OPS and isinstance(exit_jump.argval, int) and exit_jump.argval < head:
+            self._retarget[exit_jump.offset] = finish
+            self._save_tail_for_merge(exit_jump.argval, finish)
+            tail = getattr(self, '_tails_at_merge', {}).get(finish)
+            if tail:
+                live = next((ins for ins in tail if ins.offset not in self._drops
+                             or ins.offset in getattr(self, '_tail_offsets', ())), None)
+                if live is not None:
+                    self._retarget[exit_jump.offset] = live.offset
+        return True
+
     def _analyse_handlers(self):
         """Rewrite the 3.11 handler dispatch into the 3.9 ``DUP_TOP`` shape.
 
@@ -2285,11 +2556,18 @@ class Rewriter(object):
         before = self.try_before
         replace = self.try_replace
         entries = _exception_entries(self.code)
+        self._exception_group_heads = set()
+        self._exception_group_exits = []
+        visited = set()
         for entry in entries:
             index = by_offset.get(entry.target)
-            if index is None or raw_list[index].opname != 'PUSH_EXC_INFO':
+            if index is None or raw_list[index].opname != 'PUSH_EXC_INFO' or entry.target in visited:
                 continue
+            visited.add(entry.target)
             self._handler_heads.add(entry.target)
+            if self._rewrite_exception_group(entry.target):
+                self._exception_group_heads.add(entry.target)
+                continue
             if self._is_finally_handler(raw_list, index):
                 # A ``finally`` handler is not a clause of an ``except`` chain:
                 # it runs the clause and re-raises.  3.9 wrote it without the
@@ -2454,6 +2732,8 @@ class Rewriter(object):
         step = self._return_none_at(index)
         if step is None:
             return
+        if self._return_none_unwinds_loop(step):
+            return
         if not hasattr(self, '_source_none_return_spans'):
             self._source_none_return_spans = set()
             for candidate in range(2, len(self.raw)):
@@ -2479,6 +2759,21 @@ class Rewriter(object):
         if kept is not None:
             for offset in copied:
                 self._epilogue_copies[offset] = kept
+
+    def _return_none_unwinds_loop(self, step):
+        """An iterator pop in an out-of-line loop handler is a real exit."""
+        raw_list = self.raw
+        if step == 0 or raw_list[step - 1].opname != 'POP_TOP':
+            return False
+        handler = next((raw.offset for raw in reversed(raw_list[:step])
+                        if raw.opname == 'PUSH_EXC_INFO'), None)
+        if handler is None:
+            return False
+        return any(entry.target == handler
+                   and any(raw.opname == 'FOR_ITER'
+                           and raw.offset < entry.start < raw.argval
+                           for raw in raw_list)
+                   for entry in _exception_entries(self.code))
 
     def _kept_copy_before(self, step):
         """Address of the surviving implicit return that the copy at *step* duplicates.
@@ -2808,7 +3103,7 @@ class Rewriter(object):
         raw_list = self.raw
         by_offset = {raw.offset: n for n, raw in enumerate(raw_list)}
         close_merges = self._close_merge_offsets()
-        tails = getattr(self, '_tails_at_merge', {})
+        tails = self._coalesce_group_tails(getattr(self, '_tails_at_merge', {}))
         ignore_drops = getattr(self, '_tail_offsets', frozenset())
         index = 0
         while index < len(raw_list):
@@ -2831,6 +3126,8 @@ class Rewriter(object):
                         k += 1
             index = self._translate_step(index, out, runs, shape, close_merges)
         self._retarget_stray_jumps(out)
+        if tails and self._exception_group_heads:
+            out = Decompiler310()._renumber_stream(out)
         return out
 
     def _retarget_stray_jumps(self, out):
@@ -3013,6 +3310,14 @@ class Rewriter(object):
         raw_list = self.raw
         raw = raw_list[index]
         opname = raw.opname
+        for slot, owner in enumerate(getattr(self, '_pre_closes', {}).get(raw.offset, ())):
+            pop = self._make(raw, 'POP_BLOCK', None, None, line_no=None)
+            if slot:
+                pop.offset = self._fresh_offset(raw.offset)
+            out.append(pop)
+        if raw.offset in getattr(self, '_with_handler_markers', ()):
+            out.append(self._make(raw, 'WITH_EXCEPT_START', None, None, block_id=raw.offset))
+            return index + 1
         loop_exit = getattr(self, '_loop_breaks', {}).get(raw.offset)
         if loop_exit is not None:
             out.append(self._make(raw, 'JUMP_ABSOLUTE', loop_exit, loop_exit,
@@ -3391,10 +3696,10 @@ class Rewriter(object):
         return runs
 
     def _make(self, raw, opname, arg, argval, line_no=None,
-              synthetic_loop_exit=False, offset=None):
+              synthetic_loop_exit=False, offset=None, block_id=None):
         """Build one 3.9 :class:`Instruction` standing in for *raw*."""
         if line_no is None:
-            line_no = raw.starts_line
+            line_no = _line_of(raw)
         if offset is None:
             offset = raw.offset
         return Instruction(
@@ -3408,6 +3713,7 @@ class Rewriter(object):
             is_jump_target=offset in self.jump_targets,
             synthetic_loop_exit=synthetic_loop_exit,
             positions=getattr(raw, 'positions', None),
+            block_id=block_id,
         )
 
 
@@ -3507,6 +3813,11 @@ class Decompiler311(Decompiler310):
         """
         if handler_start_idx <= try_end_idx or handler_start_idx >= len(instructions):
             return [], None
+        tail = self._exception_group_tail_start(instructions, try_end_idx, handler_start_idx)
+        if tail is not None:
+            body, _ = super()._collect_finally_body(
+                code, instructions, handler_start_idx - 1, handler_start_idx)
+            return body, tail
 
         if try_end_idx + 1 == handler_start_idx:
             # Nothing was pasted between the block pop and the handler: every
@@ -3520,6 +3831,17 @@ class Decompiler311(Decompiler310):
 
         start = try_end_idx + 1
         if instructions[start].opname in ("JUMP_FORWARD", "JUMP_ABSOLUTE"):
+            previous = try_end_idx - 1
+            while previous >= 0 and instructions[previous].opname == "POP_BLOCK":
+                previous -= 1
+            if (previous > 0 and instructions[previous].opname == "POP_EXCEPT"
+                    and instructions[previous - 1].opname == "END_EXCEPT_STAR_CHAIN"):
+                # The group exit resumes a relocated normal tail. The
+                # finally suite itself is recoverable from its handler copy.
+                body, resume = super()._collect_finally_body(
+                    code, instructions, handler_start_idx - 1, handler_start_idx)
+                landing = self._find_target_idx(instructions, self._jump_target(instructions[start]))
+                return body, landing if start < landing < handler_start_idx else resume
             # Inline copy closed with a jump; resume after the handler.
             end = start
             handler_end = self._handler_end(instructions, handler_start_idx)

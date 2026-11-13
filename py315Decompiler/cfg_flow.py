@@ -48,7 +48,7 @@ _BLOCK_POPS = frozenset(("POP_BLOCK",))
 _CONDITIONAL_JUMPS = frozenset((
     "POP_JUMP_IF_FALSE", "POP_JUMP_IF_TRUE", "POP_JUMP_IF_NONE",
     "POP_JUMP_IF_NOT_NONE", "JUMP_IF_FALSE_OR_POP", "JUMP_IF_TRUE_OR_POP",
-    "JUMP_IF_NOT_EXC_MATCH",
+    "JUMP_IF_NOT_EXC_MATCH", "JUMP_IF_NOT_EG_MATCH",
 ))
 
 _LOOP_HEADS = frozenset(("FOR_ITER",))
@@ -370,8 +370,13 @@ def classify_handler(instructions, entry: int, setup_op: str = "") -> str:
         return KIND_FINALLY
     if window[:3] == ["POP_TOP", "POP_TOP", "POP_TOP"]:
         return KIND_EXCEPT
-    if window[0] == "DUP_TOP" and "JUMP_IF_NOT_EXC_MATCH" in window[:4]:
-        return KIND_EXCEPT
+    if window[0] == "DUP_TOP":
+        for instr in instructions[entry + 1:]:
+            if instr.opname in ("JUMP_IF_NOT_EXC_MATCH", "JUMP_IF_NOT_EG_MATCH"):
+                return KIND_EXCEPT
+            if instr.opname not in ("LOAD_GLOBAL", "LOAD_NAME", "LOAD_FAST",
+                                    "LOAD_DEREF", "LOAD_ATTR", "BUILD_TUPLE", "EXTENDED_ARG"):
+                break
     if (window[0] == "LOAD_CONST" and instructions[entry].argval is None
             and len(window) > 3
             and window[1] in ("STORE_FAST", "STORE_NAME", "STORE_DEREF")

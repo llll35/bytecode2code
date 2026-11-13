@@ -16,6 +16,7 @@ from .errors import DecompilationError
 #: was handed is not an ``assert`` after all, so the caller can back out instead
 #: of inventing one.
 _NOT_AN_ASSERT = object()
+_ANY_ARG = object()
 
 
 def _as_missing_bound(node):
@@ -1661,12 +1662,13 @@ class Decompiler:
     _COPY_BRANCH_OPS = ("POP_JUMP_IF_FALSE", "POP_JUMP_IF_TRUE",
                         "JUMP_IF_FALSE_OR_POP", "JUMP_IF_TRUE_OR_POP",
                         "JUMP_IF_NOT_EXC_MATCH", "JUMP_IF_NOT_EG_MATCH")
+    _ADDRESS_OPS = _JUMP_OPNAMES
 
     def _clause_ops(
         self, instructions: List[Instruction], handler_start_idx: int,
         clause_len: int,
-    ) -> List[str]:
-        """Opnames of the ``finally`` clause as the handler spells it.
+    ) -> List[Tuple[str, Any]]:
+        """Opcode/operand pairs of the finally clause, excluding its drain.
 
         The handler runs with the exception still on the value stack, so where
         the clause leaves -- a ``return`` out of the middle of it -- the compiler
@@ -1676,7 +1678,7 @@ class Decompiler:
         match then stopped one instruction short and the exit's own ``LOAD`` was
         hidden as clause content, turning ``return -1`` into ``return``.
         """
-        ops: List[str] = []
+        ops: List[Tuple[str, Any]] = []
         t = 0
         while t < clause_len:
             index = handler_start_idx + t
@@ -1689,10 +1691,17 @@ class Decompiler:
                        in ("POP_TOP", "POP_EXCEPT", "END_FINALLY")):
                     t += 1
                 continue
-            ops.append(name)
+            ops.append(self._pattern_item(instructions, index))
             t += 1
         return ops
         return ops
+
+    @staticmethod
+    def _pattern_item(instructions: List[Instruction], index: int):
+        instr = instructions[index]
+        # Copies relocate their jumps, but constants and names must still
+        # match: print('a') and print('b') are not the same finally clause.
+        return (instr.opname, _ANY_ARG if instr.opname in Decompiler._ADDRESS_OPS else instr.argval)
 
     def _inline_clause_end(
         self, instructions: List[Instruction], start: int, handler_start_idx: int,
@@ -1733,7 +1742,7 @@ class Decompiler:
             if instructions[i].opname == "EXTENDED_ARG":
                 i += 1
                 continue
-            if instructions[i].opname == h_name:
+            if self._pattern_item(instructions, i) == self._pattern_item(instructions, h):
                 # The two copies close the same block here, so they step on
                 # together: the inline run's own ``POP_BLOCK`` belongs to the
                 # clause, not to the code that follows the ``try``.
@@ -1780,7 +1789,7 @@ class Decompiler:
 
     def _copy_pattern(
         self, instructions: List[Instruction], start: int, cap: int = 48
-    ) -> Tuple[List[str], int]:
+    ) -> Tuple[List[Tuple[str, Any]], int]:
         """Opname sequence of the ``finally`` copy that begins at *start*.
 
         A copy ends where control leaves the clause -- an unconditional jump or
@@ -1792,7 +1801,7 @@ class Decompiler:
         meaning of its own here.
         """
         n = len(instructions)
-        pat: List[str] = []
+        pat: List[Tuple[str, Any]] = []
         j = start
         resume: Optional[int] = None
         while j < n and len(pat) < cap:
@@ -1807,20 +1816,22 @@ class Decompiler:
                     if op in self._COPY_BRANCH_OPS:
                         resume = self._find_target_idx(
                             instructions, self._jump_target(instructions[j]))
-                pat.append(op)
+                pat.append(self._pattern_item(instructions, j))
             j += 1
         return pat, j
 
     def _copy_matches(
-        self, instructions: List[Instruction], at: int, pat: List[str]
+        self, instructions: List[Instruction], at: int, pat: List[Tuple[str, Any]]
     ) -> Optional[int]:
         """Index just past the copy of *pat* starting at *at*, or ``None``."""
         n = len(instructions)
         j = at
-        for want in pat:
+        for want_name, want_arg in pat:
             while j < n and instructions[j].opname == "EXTENDED_ARG":
                 j += 1
-            if j >= n or instructions[j].opname != want:
+            if j >= n or instructions[j].opname != want_name:
+                return None
+            if want_arg is not _ANY_ARG and instructions[j].argval != want_arg:
                 return None
             j += 1
         return j
@@ -1846,7 +1857,7 @@ class Decompiler:
         ``return`` is cut short by the exit that runs it.
         """
         n = len(instructions)
-        patterns: List[List[str]] = []
+        patterns: List[List[Tuple[str, Any]]] = []
         clause_len = self._finally_clause_length(instructions, handler_start_idx)
         if 0 < clause_len <= 32:
             patterns.append(self._clause_ops(
@@ -2172,6 +2183,20 @@ class Decompiler:
                 i = loop_end
                 continue
             instr = instructions[i]
+            source_line = instr.line_no
+            if source_line is None:
+                source_line = getattr(getattr(instr, "positions", None), "lineno", None)
+            # Pattern copies and failure cleanup are not ordinary if expressions.
+            if not stack and source_line is not None and instr.opname in (
+                    "LOAD_CONST", "LOAD_FAST", "LOAD_NAME", "LOAD_GLOBAL", "LOAD_DEREF"):
+                from .pattern_match import read_match
+                with self._isolated_state():
+                    matched = read_match(self, code, instructions, i, n)
+                if matched is not None:
+                    node, after = matched
+                    stmts.append(node)
+                    i = after
+                    continue
             chain_consumed = self._try_emit_chain_cond(
                 code, instructions, i, n, stack, stmts
             )
@@ -3067,6 +3092,11 @@ class Decompiler:
                         ):
                             inner_body[:] = [ret]
                             skip_to = resume + 2
+                        elif (instructions[resume].opname == "RETURN_VALUE"
+                              and isinstance(inner_body[-1], ast.Return)):
+                            # The return was reconstructed in the innermost
+                            # body; this opcode only completes its unwind.
+                            skip_to = resume + 1
                     elif try_stack and (
                         not try_body
                         or (len(try_body) == 1 and isinstance(try_body[0], ast.Pass))
@@ -6332,7 +6362,19 @@ class Decompiler:
         # ``continue``) the teardown handed back -- is folded; a statement that
         # genuinely runs after the inner block exits stays where it is and
         # keeps the nesting.
+        own_line = instr.line_no
+        if own_line is None:
+            own_line = getattr(getattr(instr, "positions", None), "lineno", None)
+        if own_line is None:
+            probe = idx - 1
+            while probe >= 0:
+                if instructions[probe].line_no is not None:
+                    own_line = instructions[probe].line_no
+                    break
+                probe -= 1
         while body and type(body[0]) is with_cls \
+                and (own_line is None
+                     or getattr(body[0], '_src_line', None) in (None, own_line)) \
                 and all(isinstance(stmt, (ast.Return, ast.Break, ast.Continue))
                         for stmt in body[1:]):
             inner = body[0]
@@ -6345,9 +6387,9 @@ class Decompiler:
                 # real body is the value its teardown handed back.
                 inner_body = []
             body = inner_body + tail
-        stmts.append(
-            with_cls(items=items, body=body or [ast.Pass()])
-        )
+        with_node = with_cls(items=items, body=body or [ast.Pass()])
+        with_node._src_line = own_line
+        stmts.append(with_node)
         # A value still pending when the body ends belongs to the enclosing
         # statement: ``with a as x, b as y: return x + y`` evaluates the
         # expression inside both blocks and only returns after both have

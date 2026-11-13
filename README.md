@@ -79,6 +79,7 @@ Project itself:
 
 ```
 main.py                 the CLI: routes a .pyc to the back end for its version
+tripwire.py             adversarial AST/code-object/behavior round-trip driver
 
 py39Decompiler/         the 3.9 back end, and the shape every other one targets
   pyc_parser.py         .pyc header decoding, magic -> version, marshal read
@@ -105,6 +106,8 @@ tests/
   control_flow_cases.py shared modern control-flow scenarios
   test_modern_control_flow.py exception-region and behaviour checks for 3.11–3.13
   test_crash_regression.py stack/cleanup/short-circuit regression for 3.9–3.15
+  test_nightmare_regression.py focused pattern/loop/finally regressions for 3.9–3.15
+  test_tripwire_regression.py nested-pattern and guard decision-graph regressions
   repro/                one-off reproduction inputs
 
 embed_python/           the seven CPython interpreters (not tracked)
@@ -117,6 +120,10 @@ cost is that `decompiler.py` exists seven times, and a reader fix has to be
 ported **by anchor** to each copy -- never by copying a whole file over another,
 because the per-version copies differ in line endings and in which methods they
 override.
+
+The 3.10–3.15 back ends also have their own `pattern_match.py`. It reads pattern
+dispatch before the ordinary expression reader consumes the subject copies,
+unpacking and failure cleanup.
 
 ## How the reconstruction works
 
@@ -176,6 +183,26 @@ including AST fidelity, round-trips, exceptions, and evaluation order. Run it
 alone with `embed_python/python-X.Y/python.exe tests/test_crash_regression.py`.
 Results and known limitations are tracked
 in `bugs.md`.
+
+`python nightmare.py` runs the stricter stress sample, including source AST
+fidelity. It currently passes 82/94 checks; the remaining 12 are source-shape
+ambiguities or unreachable suites removed by the compiler, not code-object
+comparison failures. Its comparison rules are unchanged. Focused regressions
+run separately with `embed_python/python-X.Y/python.exe tests/test_nightmare_regression.py`.
+
+`python tripwire.py` runs a separate adversarial sample against all seven
+embedded interpreters. It checks nested sequence/class/mapping patterns, mixed
+and multiline guards, subject evaluation, and loop exits through `finally`.
+Every case must preserve its AST, code objects, return/exception outcome and
+side-effect order. It passes **98/98** applicable checks and **2309** behavioral
+scenarios; Python 3.9 explicitly skips `match` and runs the two syntax-independent
+controls. For a focused run or a complete JSON report:
+
+```
+python tripwire.py --version 3.14 --case mapping_nested --verbose
+python tripwire.py --json tripwire-results.json
+embed_python/python-3.14/python.exe tests/test_tripwire_regression.py
+```
 
 ## Limitations
 

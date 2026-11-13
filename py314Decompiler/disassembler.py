@@ -21,6 +21,8 @@ def _line_of(instr: dis.Instruction) -> Optional[int]:
     3.13, where the number moved to ``positions.lineno``.
     """
     line = getattr(instr, "starts_line", None)
+    if isinstance(line, bool):
+        return getattr(getattr(instr, "positions", None), "lineno", None) if line else None
     if line is not None:
         return line
     positions = getattr(instr, "positions", None)
@@ -42,6 +44,7 @@ class Instruction:
     synthetic_loop_exit: bool = False
     # PEP 657 source span, including the copies the compiler threads into exits.
     positions: Any = None
+    block_id: Optional[int] = None
 
     def __str__(self):
         parts = []

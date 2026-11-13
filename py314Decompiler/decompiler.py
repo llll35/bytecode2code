@@ -42,7 +42,7 @@ _JUMP_OPNAMES = frozenset((
     "POP_JUMP_FORWARD_IF_FALSE", "POP_JUMP_FORWARD_IF_TRUE",
     "POP_JUMP_BACKWARD_IF_FALSE", "POP_JUMP_BACKWARD_IF_TRUE",
     "JUMP_IF_FALSE_OR_POP", "JUMP_IF_TRUE_OR_POP",
-    "JUMP_IF_NOT_EXC_MATCH", "CHECK_EXC_MATCH", "FOR_ITER",
+    "JUMP_IF_NOT_EXC_MATCH", "JUMP_IF_NOT_EG_MATCH", "CHECK_EXC_MATCH", "FOR_ITER",
     "SEND", "SETUP_FINALLY", "SETUP_EXCEPT", "SETUP_WITH", "SETUP_ASYNC_WITH",
     "SETUP_LOOP", "SETUP_CLEANUP",
 ))
@@ -675,9 +675,15 @@ class Decompiler:
         if tail_idx >= len(instructions):
             return False
         target = instructions[tail_idx].offset
-        for ins in instructions[:tail_idx]:
+        for index, ins in enumerate(instructions[:tail_idx]):
             if ins.opname not in ("JUMP_ABSOLUTE", "JUMP_FORWARD"):
                 continue
+            previous = index - 1
+            while previous >= 0 and instructions[previous].opname == "POP_BLOCK":
+                previous -= 1
+            if (previous > 0 and instructions[previous].opname == "POP_EXCEPT"
+                    and instructions[previous - 1].opname == "END_EXCEPT_STAR_CHAIN"):
+                continue  # compiler subgroup merge, not a source return
             if ins.offset < target and _jump_target(ins) == target:
                 return True
         return False
@@ -813,7 +819,14 @@ class Decompiler:
                 tuple_arity = int(op.arg or 0)
                 j += 1
                 continue
-            if op.opname in ("JUMP_IF_NOT_EXC_MATCH", "CHECK_EXC_MATCH"):
+            if op.opname == "LOAD_ATTR" and names:
+                names[-1] = ast.Attribute(value=names[-1], attr=str(op.argval), ctx=ast.Load())
+                j += 1
+                continue
+            if op.opname == "EXTENDED_ARG":
+                j += 1
+                continue
+            if op.opname in ("JUMP_IF_NOT_EXC_MATCH", "JUMP_IF_NOT_EG_MATCH", "CHECK_EXC_MATCH"):
                 match_op_idx = j
                 match_target = self._jump_target(op)
                 j += 1
@@ -833,7 +846,7 @@ class Decompiler:
         as_setup_target: Optional[int] = None
         if j < raw_end and instructions[j].opname == "POP_TOP":
             j += 1
-            if j < raw_end and instructions[j].opname == "STORE_FAST":
+            if j < raw_end and instructions[j].opname in self._STORE_OPS:
                 exc_name = str(instructions[j].argval)
                 j += 1
                 if j < raw_end and instructions[j].opname == "POP_TOP":
@@ -1088,6 +1101,19 @@ class Decompiler:
         )
         if has_return_tail and body_stack:
             body.append(ast.Return(value=body_stack.pop()))
+        if (has_return_tail and pop_except_seen and self._loop_stack
+                and getattr(code, "co_flags", 0) & 0x20 and body
+                and isinstance(body[-1], ast.Return)
+                and isinstance(body[-1].value, ast.Constant)
+                and body[-1].value.value is None):
+            position = getattr(instructions[except_idx], "positions", None)
+            if (position is not None and position.lineno == position.end_lineno
+                    and position.col_offset is not None
+                    and position.end_col_offset - position.col_offset == 6):
+                # The exit's POP_EXCEPT carries the six-column "return"
+                # span even when finally copies inherit the return opcode's
+                # position. A written "return None" has a wider span.
+                body[-1].value = None
         if not body:
             body = [ast.Pass()]
         post = self._find_target_idx(instructions, merge_target) \
@@ -1231,6 +1257,93 @@ class Decompiler:
                 return k
         return start + 1
 
+    def _is_exception_group_handler(self, instructions, start):
+        for ins in instructions[start:]:
+            if ins.opname in ("JUMP_IF_NOT_EXC_MATCH", "JUMP_IF_NOT_EG_MATCH"):
+                return ins.opname == "JUMP_IF_NOT_EG_MATCH"
+            if ins.opname not in ("DUP_TOP", "LOAD_NAME", "LOAD_GLOBAL", "LOAD_FAST",
+                                  "LOAD_DEREF", "LOAD_ATTR", "BUILD_TUPLE", "EXTENDED_ARG"):
+                break
+        return False
+
+    def _exception_group_tail_start(self, instructions, try_end_idx, handler_idx):
+        """Continuation reached by the subgroup merge inside this finally."""
+        target = instructions[handler_idx].offset
+        setups = [i for i in range(try_end_idx + 1)
+                  if instructions[i].opname in ("SETUP_FINALLY", "SETUP_EXCEPT")
+                  and self._jump_target(instructions[i]) == target]
+        if not setups:
+            return None
+        tail = None
+        for i in range(max(setups) + 1, handler_idx):
+            if instructions[i].opname != "END_EXCEPT_STAR_CHAIN":
+                continue
+            post = self._find_target_idx(instructions, instructions[i].argval)
+            exit_idx = post + 1
+            while exit_idx < handler_idx and instructions[exit_idx].opname == "POP_BLOCK":
+                exit_idx += 1
+            if exit_idx >= handler_idx or instructions[exit_idx].opname not in ("JUMP_FORWARD", "JUMP_ABSOLUTE"):
+                continue
+            landing = self._find_target_idx(instructions, self._jump_target(instructions[exit_idx]))
+            if not max(try_end_idx, exit_idx) < landing < handler_idx:
+                continue
+            h0 = handler_idx
+            while h0 < len(instructions) and instructions[h0].opname in self._BLOCK_NOISE:
+                h0 += 1
+            end, complete = self._inline_clause_end(instructions, landing, h0)
+            # An equal prefix alone is not a copy: append('after') can share
+            # its first two opcodes with append('finally').
+            tail = end if complete and end > landing else landing
+        return tail
+
+    def _parse_exception_group_handlers(self, code, instructions, start, try_end_idx=None):
+        handlers = []
+        owner = instructions[start].argval
+        scan = start
+        total = len(instructions)
+        while scan < total:
+            prefix = self._parse_exception_prologue(instructions, scan, total)
+            if prefix is None:
+                raise DecompilationError('invalid except-star clause prefix')
+            exc_type, name, target, body_start, _, _ = prefix
+            next_clause = self._find_target_idx(instructions, target)
+            body_end = next((i for i in range(body_start, next_clause + 1)
+                             if instructions[i].opname == "END_EXCEPT_STAR_BODY"
+                             and instructions[i].argval == owner), None)
+            if body_end is None:
+                raise DecompilationError('except-star clause has no body boundary')
+            body = self._emit_statements(code, instructions, start=body_start, end=body_end)
+            handlers.append(ast.ExceptHandler(type=exc_type, name=name, body=body or [ast.Pass()]))
+            scan = next_clause
+            if instructions[scan].opname == "END_EXCEPT_STAR_CHAIN":
+                post = self._find_target_idx(instructions, instructions[scan].argval)
+                self._handled_ranges.append((start, post))
+                if try_end_idx is not None and try_end_idx + 1 < total and post + 1 < total:
+                    success_idx, merge_idx = try_end_idx + 1, post + 1
+                    while success_idx < total and instructions[success_idx].opname == "POP_BLOCK":
+                        success_idx += 1
+                    while merge_idx < total and instructions[merge_idx].opname == "POP_BLOCK":
+                        merge_idx += 1
+                    if success_idx >= total or merge_idx >= total:
+                        return handlers, [], post
+                    success, merge = instructions[success_idx], instructions[merge_idx]
+                    if success.opname in ("JUMP_FORWARD", "JUMP_ABSOLUTE") and merge.opname in ("JUMP_FORWARD", "JUMP_ABSOLUTE"):
+                        begin = self._find_target_idx(instructions, self._jump_target(success))
+                        end = self._find_target_idx(instructions, self._jump_target(merge))
+                        if post < begin < end:
+                            orelse = self._emit_statements(code, instructions, start=begin, end=end)
+                            self._handled_ranges.append((post, merge_idx + 1))
+                            return handlers, orelse, end
+                    elif (success.opname in ("JUMP_FORWARD", "JUMP_ABSOLUTE")
+                          and merge.opname == "LOAD_CONST" and merge.argval is None):
+                        begin = self._find_target_idx(instructions, self._jump_target(success))
+                        if post < begin:
+                            orelse = self._emit_statements(code, instructions, start=begin, end=total)
+                            self._handled_ranges.append((post, begin))
+                            return handlers, orelse, total
+                return handlers, [], post
+        raise DecompilationError('except-star chain has no end boundary')
+
     def _parse_except_handlers(
         self,
         code,
@@ -1248,6 +1361,8 @@ class Decompiler:
         """
         if handler_start_idx >= len(instructions):
             return None
+        if self._is_exception_group_handler(instructions, handler_start_idx):
+            return self._parse_exception_group_handlers(code, instructions, handler_start_idx, try_end_idx)
         raw_end = len(instructions)
         prologue = self._parse_exception_prologue(instructions,
                                                   handler_start_idx, raw_end)
@@ -1693,6 +1808,10 @@ class Decompiler:
             if name == "EXTENDED_ARG":
                 t += 1
                 continue
+            drain_end = self._return_exception_drain_end(instructions, index)
+            if drain_end is not None:
+                t = drain_end - handler_start_idx
+                continue
             if name == "POP_TOP" and self._is_exc_drain(instructions, index):
                 while (t < clause_len and instructions[handler_start_idx + t].opname
                        in ("POP_TOP", "POP_EXCEPT", "END_FINALLY")):
@@ -1744,6 +1863,10 @@ class Decompiler:
             if h_name == "EXTENDED_ARG":
                 h += 1
                 continue
+            drain_end = self._return_exception_drain_end(instructions, h)
+            if drain_end is not None:
+                h = drain_end
+                continue
             if self._is_exc_drain(instructions, h) \
                     and instructions[i].opname != "POP_TOP":
                 # A drain the inline run also spells -- the ``POP_TOP`` /
@@ -1757,11 +1880,29 @@ class Decompiler:
             if instructions[i].opname == "EXTENDED_ARG":
                 i += 1
                 continue
-            if instructions[i].opname != h_name:
+            if self._pattern_item(instructions, i) != self._pattern_item(instructions, h):
                 break
             i += 1
             h += 1
         return min(i, handler_start_idx), False
+
+    @staticmethod
+    def _return_exception_drain_end(instructions, index):
+        """Skip the exception stack below a finally return's pending value."""
+        rotations = ("ROT_TWO", "ROT_THREE", "ROT_FOUR")
+        if instructions[index].opname not in rotations:
+            return None
+        end = index + 1
+        first_pop = end
+        while end < len(instructions) and instructions[end].opname == "POP_TOP":
+            end += 1
+        if end == first_pop:
+            return None
+        if end < len(instructions) and instructions[end].opname in rotations:
+            end += 1
+        if end < len(instructions) and instructions[end].opname == "POP_EXCEPT":
+            return end + 1
+        return None
 
     def _is_exc_drain(self, instructions: List[Instruction], index: int) -> bool:
         """Is ``POP_TOP`` at *index* the head of an exception-stack drain?
@@ -1874,6 +2015,12 @@ class Decompiler:
                 # sits bare where 3.9 wrote a pop.
                 copy_start = j
                 at_pop = False
+            original = getattr(instructions[handler_start_idx], 'positions', None)
+            candidate = getattr(instructions[copy_start], 'positions', None)
+            if (original is not None and original.lineno is not None
+                    and candidate is not None and candidate.lineno is not None
+                    and original != candidate):
+                continue
             k = None
             for pat in patterns:
                 k = self._copy_matches(instructions, copy_start, pat)
@@ -2176,6 +2323,20 @@ class Decompiler:
                 i = loop_end
                 continue
             instr = instructions[i]
+            source_line = instr.line_no
+            if source_line is None:
+                source_line = getattr(getattr(instr, "positions", None), "lineno", None)
+            # Pattern copies and failure cleanup are not ordinary if expressions.
+            if not stack and source_line is not None and instr.opname in (
+                    "LOAD_CONST", "LOAD_FAST", "LOAD_NAME", "LOAD_GLOBAL", "LOAD_DEREF"):
+                from .pattern_match import read_match
+                with self._isolated_state():
+                    matched = read_match(self, code, instructions, i, n)
+                if matched is not None:
+                    node, after = matched
+                    stmts.append(node)
+                    i = after
+                    continue
             chain_consumed = self._try_emit_chain_cond(
                 code, instructions, i, n, stack, stmts
             )
@@ -3077,6 +3238,15 @@ class Decompiler:
                         ):
                             inner_body[:] = [ret]
                             skip_to = resume + 2
+                        elif (instructions[resume].opname == "RETURN_VALUE"
+                              and isinstance(inner_body[-1], ast.Return)):
+                            # The innermost body already ends with the return
+                            # the value was loaded for; the deferred
+                            # ``RETURN_VALUE`` only unwinds the enclosing
+                            # blocks, so it is not a second statement.  Leave
+                            # it to the next emission and it would show up as a
+                            # bare ``return`` behind the whole ``try``.
+                            skip_to = resume + 1
                     elif try_stack and (
                         not try_body
                         or (len(try_body) == 1 and isinstance(try_body[0], ast.Pass))
@@ -3097,8 +3267,13 @@ class Decompiler:
                     orelse = self._recover_else_clause(
                         code, instructions, try_end_idx, handler_start_idx, post)
                 skip_to = post
-            stmts.append(ast.Try(body=try_body, handlers=handlers, orelse=orelse,
-                                 finalbody=finalbody))
+            try_class = (ast.TryStar if handlers
+                         and self._is_exception_group_handler(instructions, handler_start_idx)
+                         else ast.Try)
+            try_node = try_class(body=try_body, handlers=handlers, orelse=orelse,
+                                 finalbody=finalbody)
+            try_node._src_col = self._try_source_column(code, instructions, instr_start, handler_start_idx)
+            stmts.append(try_node)
             stmts.extend(trailing)
             return max(1, skip_to - idx)
         if opname == "RERAISE":
@@ -4371,6 +4546,7 @@ class Decompiler:
         body_end: int,
         exit_offset: int,
         limit: int,
+        loop_index: Optional[int] = None,
     ) -> Optional[Tuple[List[ast.stmt], int]]:
         """Build the ``else:`` clause of a ``for`` loop and where the loop ends.
 
@@ -4387,6 +4563,8 @@ class Decompiler:
         """
         total = len(instructions)
         if start >= total:
+            return None
+        if instructions[start].opname == "POP_BLOCK":
             return None
         stops = [
             self._find_target_idx(instructions, self._jump_target(instructions[j]))
@@ -4407,6 +4585,39 @@ class Decompiler:
                     if instructions[j].opname in ("JUMP_ABSOLUTE", "JUMP_FORWARD")
                     and self._jump_target(instructions[j]) == head
                 ]
+        if not stops and loop_index is not None:
+            span = instructions[loop_index].positions
+            first = instructions[start].positions
+            last_line = getattr(span, "end_lineno", None)
+            line = getattr(first, "lineno", None)
+            column = getattr(first, "col_offset", None)
+            loop_column = getattr(span, "col_offset", None)
+            if (last_line is not None and line is not None
+                    and span.lineno < line <= last_line
+                    and (column is None or loop_column is None or column > loop_column)):
+                stop = start
+                for j in range(start, min(limit, total)):
+                    line = getattr(instructions[j].positions, "lineno", None)
+                    if line is not None and (line > last_line or line < span.lineno):
+                        break
+                    if line is not None:
+                        stop = j + 1
+                if stop > start:
+                    stops.append(stop)
+            elif (line is not None and span is not None and line > span.lineno
+                  and instructions[loop_index].opname == "FOR_ITER"
+                  and loop_index + 1 < total):
+                # FOR_ITER is attributed to the iterable in 3.13+; the
+                # binding starts four columns after the source's "for ".
+                binding = instructions[loop_index + 1].positions
+                binding_column = getattr(binding, "col_offset", None)
+                if binding_column is not None and column is not None and column > binding_column - 4:
+                    stop = self._for_else_suite_end(
+                        code, instructions, start, min(limit, total),
+                        span.lineno, binding_column - 4,
+                    )
+                    if stop > start:
+                        stops.append(stop)
         if not stops:
             return None
         stop = min(stops)
@@ -4418,6 +4629,57 @@ class Decompiler:
             ),
             stop,
         )
+
+    def _for_else_suite_end(self, code, instructions, start, limit, loop_line, loop_column):
+        """End a no-break else suite using the bytecode's source positions.
+
+        A following try can lose its low-column NOP during rewriting, so
+        include positions from the original stream instead of absorbing its
+        indented body into the loop's else clause.
+        """
+        boundary = limit
+        if hasattr(code, "co_positions"):
+            raw = list(dis.get_instructions(code))
+            for index, instr in enumerate(raw):
+                if instr.offset < instructions[start].offset:
+                    continue
+                position = instr.positions
+                column = getattr(position, "col_offset", None)
+                line = getattr(position, "lineno", None)
+                if instr.opname == "FOR_ITER" and index + 1 < len(raw):
+                    binding = raw[index + 1].positions
+                    if binding.lineno == line and binding.col_offset is not None:
+                        column = binding.col_offset - 4
+                elif (instr.opname == "RETURN_VALUE" and index > 0
+                      and raw[index - 1].opname in ("LOAD_SMALL_INT", "LOAD_CONST")
+                      and raw[index - 1].argval is not None
+                      and position == raw[index - 1].positions
+                      and column is not None and column >= 7):
+                    # A constant return is attributed to the value expression
+                    # in 3.14+. Restore the indentation of its "return ".
+                    # None is excluded: an implicit epilogue can inherit the
+                    # last expression's position without a source return.
+                    column -= 7
+                if line is not None and line > loop_line and column is not None and column <= loop_column:
+                    boundary = min(boundary, self._find_target_idx(instructions, instr.offset))
+                    # An outside assignment/return/for may load its value
+                    # before the low-column store/return/binding on that line.
+                    while boundary > start and getattr(
+                            instructions[boundary - 1].positions, "lineno", None) == line:
+                        boundary -= 1
+                    break
+        stop = start
+        for j in range(start, boundary):
+            position = instructions[j].positions
+            column = getattr(position, "col_offset", None)
+            if column is not None and column <= loop_column:
+                line = getattr(position, "lineno", None)
+                while stop > start and getattr(
+                        instructions[stop - 1].positions, "lineno", None) == line:
+                    stop -= 1
+                break
+            stop = j + 1
+        return stop
 
     def _find_while_true_back_edge(
         self, instructions: List[Instruction], start: int, end: int
@@ -6199,7 +6461,7 @@ class Decompiler:
             )
             clause = self._emit_for_else(
                 code, instructions, end_idx, body_start, body_end, exit_offset,
-                len(instructions) if limit is None else limit,
+                len(instructions) if limit is None else limit, loop_index=idx,
             )
             if clause is None:
                 # A ``for``/``else`` tail that cannot be told from ordinary
@@ -6329,6 +6591,10 @@ class Decompiler:
             )
             body_start += 1
         self._hide_teardown_copies(instructions, body_start, pop_idx)
+        if (handler_start_idx < len(instructions)
+                and instructions[handler_start_idx].opname == "WITH_EXCEPT_START"
+                and instructions[handler_start_idx].block_id is not None):
+            self._handled_ranges.append((handler_start_idx, handler_start_idx + 1))
         body = self._emit_statements(
             code, instructions, is_module=False, start=body_start, end=pop_idx,
             out_stack=body_stack,
@@ -6359,14 +6625,21 @@ class Decompiler:
         returned = _NO_RETURN
         if term is not None and term.opname in ("RETURN_VALUE", "LOAD_CONST"):
             returned = self._with_return_value(instructions, term_idx, body_stack)
+        if returned is _NO_RETURN and body_stack:
+            returned = body_stack[-1]
 
-        merge_idx = self._find_stmt_run_end(instructions, pop_idx, handler_start_idx)
+        merge_idx = (term_idx if term_idx >= 0 else
+                     self._find_stmt_run_end(instructions, pop_idx, handler_start_idx))
         if returned is not _NO_RETURN:
             # The teardown also emits a bare ``return`` for the value it could
             # not attribute; drop it now that the real one is known.
             while body and _is_bare_return(body[-1]):
                 body.pop()
             if getattr(code, "co_name", None) != "<module>":
+                if getattr(code, 'co_flags', 0) & 0x200 \
+                        and isinstance(returned, ast.Constant) \
+                        and returned.value is None:
+                    returned = None
                 body.append(ast.Return(value=returned))
             # A ``return`` leaves the function, so the block's own exception
             # handler is unreachable and the enclosing range must resume past
@@ -6398,7 +6671,19 @@ class Decompiler:
         # ``continue``) the teardown handed back -- is folded; a statement that
         # genuinely runs after the inner block exits stays where it is and
         # keeps the nesting.
+        own_line = instr.line_no
+        if own_line is None:
+            own_line = getattr(getattr(instr, "positions", None), "lineno", None)
+        if own_line is None:
+            probe = idx - 1
+            while probe >= 0:
+                if instructions[probe].line_no is not None:
+                    own_line = instructions[probe].line_no
+                    break
+                probe -= 1
         while body and type(body[0]) is with_cls \
+                and (own_line is None
+                     or getattr(body[0], '_src_line', None) in (None, own_line)) \
                 and all(isinstance(stmt, (ast.Return, ast.Break, ast.Continue))
                         for stmt in body[1:]):
             inner = body[0]
@@ -6411,9 +6696,9 @@ class Decompiler:
                 # real body is the value its teardown handed back.
                 inner_body = []
             body = inner_body + tail
-        stmts.append(
-            with_cls(items=items, body=body or [ast.Pass()])
-        )
+        with_node = with_cls(items=items, body=body or [ast.Pass()])
+        with_node._src_line = own_line
+        stmts.append(with_node)
         # A value still pending when the body ends belongs to the enclosing
         # statement: ``with a as x, b as y: return x + y`` evaluates the
         # expression inside both blocks and only returns after both have
@@ -6572,6 +6857,10 @@ class Decompiler:
         only unconditional transfer in it; the ``RERAISE`` in the middle belongs
         to the ``WITH_EXCEPT_START`` protocol.
         """
+        if (handler_start_idx < len(instructions)
+                and instructions[handler_start_idx].opname == "WITH_EXCEPT_START"
+                and instructions[handler_start_idx].block_id is not None):
+            return handler_start_idx + 1
         for i in range(handler_start_idx, len(instructions)):
             if instructions[i].opname in (
                 "JUMP_ABSOLUTE", "JUMP_FORWARD", "RETURN_VALUE", "RETURN_CONST"
@@ -6884,7 +7173,7 @@ class Decompiler:
         for ins in instructions:
             moved = replace(ins)
             moved.offset = fresh[ins.offset]
-            target = _jump_target(ins)
+            target = ins.argval if ins.opname == 'END_EXCEPT_STAR_CHAIN' else _jump_target(ins)
             if isinstance(target, int):
                 aimed = resolve(target)
                 moved.argval = aimed
@@ -7376,6 +7665,24 @@ class Decompiler:
             return ast.Subscript(value=node.value, slice=node.slice, ctx=ast.Store())
         return None
 
+    def _try_source_column(self, code, instructions, setup_idx, handler_idx):
+        """Indentation of this source try, including its compiler wrapper."""
+        if self._is_exception_group_handler(instructions, handler_idx):
+            for instr in instructions[handler_idx:]:
+                if instr.opname == "JUMP_IF_NOT_EG_MATCH":
+                    return getattr(instr.positions, "col_offset", None)
+        first_line = getattr(instructions[setup_idx].positions, "lineno", None)
+        final_line = getattr(instructions[handler_idx].positions, "lineno", None)
+        if first_line is None or final_line is None or not hasattr(code, "co_positions"):
+            return None
+        candidates = [raw.positions for raw in dis.get_instructions(code)
+                      if raw.opname == "NOP" and raw.positions.lineno is not None
+                      and raw.positions.end_lineno is not None
+                      and raw.positions.col_offset is not None
+                      and raw.positions.lineno < first_line
+                      and raw.positions.lineno <= final_line <= raw.positions.end_lineno]
+        return max(candidates, key=lambda span: span.lineno).col_offset if candidates else None
+
     def _combine_try_clauses(self, stmts: List[ast.stmt]) -> None:
         """Fold the exception chain and its pure finally wrapper into one try.
 
@@ -7384,17 +7691,23 @@ class Decompiler:
         Only at emission can that exact pair be combined.  Other nested tries,
         or a wrapper with additional statements, retain their separate scopes.
         """
-        for node in ast.walk(ast.Module(body=stmts, type_ignores=[])):
-            if not isinstance(node, ast.Try) or not node.finalbody:
-                continue
-            if node.handlers or node.orelse or len(node.body) != 1:
-                continue
-            inner = node.body[0]
-            if not isinstance(inner, ast.Try) or not inner.handlers or inner.finalbody:
-                continue
-            node.body = inner.body
-            node.handlers = inner.handlers
-            node.orelse = inner.orelse
+        class Combine(ast.NodeTransformer):
+            def visit_Try(self, node):
+                self.generic_visit(node)
+                if not node.finalbody or node.handlers or node.orelse or len(node.body) != 1:
+                    return node
+                inner = node.body[0]
+                if not isinstance(inner, (ast.Try, ast.TryStar)) or not inner.handlers or inner.finalbody:
+                    return node
+                if isinstance(inner, ast.TryStar):
+                    column = getattr(node, "_src_col", None)
+                    if column is None or column != getattr(inner, "_src_col", None):
+                        return node
+                    inner.finalbody = node.finalbody
+                    return inner
+                node.body, node.handlers, node.orelse = inner.body, inner.handlers, inner.orelse
+                return node
+        Combine().visit(ast.Module(body=stmts, type_ignores=[]))
 
     def _statements_to_source(
         self,
@@ -7559,7 +7872,7 @@ class Decompiler:
             if stmt.exc is None:
                 return f"{ind}raise"
             return f"{ind}raise {self._expr_to_str(stmt.exc)}"
-        if isinstance(stmt, ast.Try):
+        if isinstance(stmt, (ast.Try, ast.TryStar)):
             lines = [f"{ind}try:"]
             for b in stmt.body:
                 s = self._stmt_to_str(b, indent + 1)
@@ -7567,10 +7880,12 @@ class Decompiler:
                     lines.append(s)
             for handler in stmt.handlers:
                 exc_type = self._expr_to_str(handler.type) if handler.type else ""
+                except_word = 'except*' if isinstance(stmt, ast.TryStar) else 'except'
                 if exc_type:
-                    lines.append(f"{ind}except {exc_type}:")
+                    suffix = f" as {handler.name}" if handler.name else ""
+                    lines.append(f"{ind}{except_word} {exc_type}{suffix}:")
                 else:
-                    lines.append(f"{ind}except:")
+                    lines.append(f"{ind}{except_word}:")
                 for b in handler.body:
                     s = self._stmt_to_str(b, indent + 2)
                     if s:
