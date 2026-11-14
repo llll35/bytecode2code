@@ -463,6 +463,7 @@ class Rewriter(object):
             self.with_exits = self._analyse_with()
         self._drop_with_unwind_teardowns()
         self.try_setups, self.try_closes = self._analyse_try()
+        self._restore_with_parent_closes()
         self._raw_offsets = {raw.offset for raw in self.raw}
         self.supers = self._analyse_super()
         self.comprehensions = self._analyse_comprehensions()
@@ -884,6 +885,10 @@ class Rewriter(object):
             start = by_offset.get(entry.target)
             if start is None:
                 continue
+            if raw_list[start].opname == 'CLEANUP_THROW':
+                # A suspended await resumes at END_SEND, not at a duplicated
+                # source tail. Moving that target would delete the real body.
+                continue
             for index in range(start, len(raw_list)):
                 raw = raw_list[index]
                 if raw.opname == 'RERAISE':
@@ -1238,6 +1243,7 @@ class Rewriter(object):
         inner.jump_targets = self.jump_targets
         inner.with_setups = {}
         inner.with_anchors = {}
+        inner.async_with_prefixes = set()
         inner._pending_conversion = None
         inner.async_with_setups = {}
         inner.with_targets = set()
@@ -1347,6 +1353,7 @@ class Rewriter(object):
         exits = set()
         self.async_with_setups = {}
         self.with_anchors = {}
+        self.async_with_prefixes = set()
         self._with_handler_markers = set()
         self._with_close_owner = {}
         for entry in _exception_entries(self.code):
@@ -1372,8 +1379,11 @@ class Rewriter(object):
                 # rotations and the ``__enter__`` call all become the 3.9
                 # ``SETUP_WITH`` that the compiler's block stack implied.
                 self.with_anchors[anchor.offset] = self._with_prefix_length(setup)
+                if _special_method(self.raw[setup + 1].arg) == '__aexit__':
+                    self.async_with_prefixes.add(anchor.offset)
             targets.add(entry.target)
-            if self.raw[setup].opname == 'BEFORE_ASYNC_WITH':
+            if (anchor.opname == 'BEFORE_ASYNC_WITH'
+                    or anchor.offset in self.async_with_prefixes):
                 # 3.9 opened the block *after* awaiting ``__aenter__()``.
                 self.async_with_setups[self.raw[start].offset] = \
                     self.raw[handler + 1].offset
@@ -1486,6 +1496,33 @@ class Rewriter(object):
                 continue
             self._drops.update(next_.offset for next_ in raw_list[index:index + 5])
 
+    def _restore_with_parent_closes(self):
+        """Restore enclosing except pops on a with handler's suppressed exit."""
+        self._with_parent_closes = {}
+        by_offset = {raw.offset: index for index, raw in enumerate(self.raw)}
+        parents = []
+        for start, targets in self.try_setups.items():
+            for target in targets:
+                at = by_offset.get(target)
+                if at is not None and any(raw.opname == 'CHECK_EXC_MATCH' for raw in self.raw[at:at + 6]):
+                    parents.append((start, target))
+        for anchor, marker in self.with_setups.items():
+            at = by_offset.get(marker)
+            if at is None:
+                continue
+            while at < len(self.raw) and self.raw[at].opname != 'POP_EXCEPT':
+                at += 1
+            at += 1
+            while at < len(self.raw) and self.raw[at].opname == 'POP_TOP':
+                at += 1
+            if at >= len(self.raw) or self.raw[at].opname != 'JUMP_FORWARD':
+                continue
+            jump = self.raw[at]
+            owners = list(dict.fromkeys(target for start, target in sorted(parents, reverse=True)
+                                        if start <= anchor < target <= jump.argval))
+            if owners:
+                self._with_parent_closes[jump.offset] = owners
+
     def _with_setup_index(self, index):
         """Index of the instruction that opens the block *index* belongs to.
 
@@ -1498,17 +1535,17 @@ class Rewriter(object):
         ``COPY``/``LOAD_SPECIAL`` sequence that binds ``__enter__`` and
         ``__exit__`` before calling ``__enter__``.
         """
-        if index >= 0 and self.raw[index].opname == 'CALL':
-            anchor = self._with_anchor_314(index)
-            if anchor is not None:
-                return anchor
         while index >= 0:
             opname = self.raw[index].opname
+            if opname == 'CALL':
+                anchor = self._with_anchor_314(index)
+                if anchor is not None:
+                    return anchor
             if opname in ('BEFORE_WITH', 'BEFORE_ASYNC_WITH'):
                 return index
             if opname not in ('SEND', 'YIELD_VALUE', 'RESUME',
                               'JUMP_BACKWARD_NO_INTERRUPT', 'END_SEND',
-                              'CLEANUP_THROW', 'LOAD_CONST', 'GET_AWAITABLE'):
+                              'CLEANUP_THROW', 'LOAD_CONST', 'GET_AWAITABLE', 'PUSH_NULL'):
                 return None
             index -= 1
         return None
@@ -1526,8 +1563,9 @@ class Rewriter(object):
             LOAD_SPECIAL __enter__
             CALL 0
 
-        and protects the code that follows ``CALL 0``.  All six instructions
-        stand for the single 3.9 ``SETUP_WITH``.
+        and protects the code that follows ``CALL 0``. For ``async with`` the
+        lookups are ``__aexit__``/``__aenter__`` and the protected range starts
+        only after the entry await; its prefix becomes ``BEFORE_ASYNC_WITH``.
         """
         raw_list = self.raw
         if call_index < 5:
@@ -1539,8 +1577,8 @@ class Rewriter(object):
             return None
         if run[0].arg != 1:
             return None
-        if _special_method(run[1].arg) != '__exit__' \
-                or _special_method(run[4].arg) != '__enter__':
+        methods = (_special_method(run[1].arg), _special_method(run[4].arg))
+        if methods not in (('__exit__', '__enter__'), ('__aexit__', '__aenter__')):
             return None
         return call_index - 5
 
@@ -1617,6 +1655,19 @@ class Rewriter(object):
         tail: List[str] = []
         while index < len(raw_list):
             opname = raw_list[index].opname
+            if opname == 'GET_AWAITABLE':
+                send = index + 1
+                if send < len(raw_list) and raw_list[send].opname == 'PUSH_NULL':
+                    send += 1
+                if send < len(raw_list) and raw_list[send].opname == 'LOAD_CONST' and raw_list[send].argval is None:
+                    send += 1
+                if send < len(raw_list) and raw_list[send].opname == 'SEND':
+                    finish = next((i for i in range(send + 1, len(raw_list))
+                                   if raw_list[i].offset == raw_list[send].argval), None)
+                    if finish is not None and raw_list[finish].opname == 'END_SEND':
+                        tail.extend(raw.opname for raw in raw_list[index:finish + 1])
+                        index = finish + 1
+                        continue
             if opname == 'RETURN_CONST':
                 self._drops.update(
                     raw.offset for raw in raw_list[handler:index + 1]
@@ -3324,6 +3375,8 @@ class Rewriter(object):
                                   synthetic_loop_exit=True))
             return index + 1
         self._emit_block_setups(raw, out)
+        for owner in getattr(self, '_with_parent_closes', {}).get(raw.offset, ()):
+            out.append(self._make(raw, 'POP_BLOCK', None, None, line_no=None))
         if index in runs:
             return self._emit_store_run(index, runs[index], out)
         if opname == 'COPY':
@@ -3346,9 +3399,14 @@ class Rewriter(object):
             # 3.15's explicit ``__enter__``/``__exit__`` prefix collapses back
             # into the single 3.9 ``SETUP_WITH``; everything up to and
             # including the ``__enter__`` call is consumed with it.
-            target = self.with_setups[raw.offset]
-            out.append(self._make(raw, 'SETUP_WITH', target, target,
-                                  line_no=None))
+            if raw.offset in self.async_with_prefixes:
+                # Keep the context expression until the awaited entry completes;
+                # SETUP_ASYNC_WITH is inserted at the protected body's start.
+                out.append(self._make(raw, 'BEFORE_ASYNC_WITH', None, None, line_no=None))
+            else:
+                target = self.with_setups[raw.offset]
+                out.append(self._make(raw, 'SETUP_WITH', target, target,
+                                      line_no=None))
             return index + prefix
         if raw.offset in self._drops and raw.offset not in ignore_drops:
             return index + 1

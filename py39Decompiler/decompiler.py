@@ -2152,6 +2152,13 @@ class Decompiler:
                 continue
             # Test loop heads only after excluding consumed handler ranges;
             # an out-of-line handler can jump back into the ordinary body.
+            if not stack and instructions[i].opname in (
+                    "LOAD_FAST", "LOAD_NAME", "LOAD_GLOBAL", "LOAD_DEREF", "LOAD_CONST"):
+                from .condition_graph import emit_mixed_while
+                mixed_loop = emit_mixed_while(self, code, instructions, i, n, stmts)
+                if mixed_loop:
+                    i += mixed_loop
+                    continue
             while_cond = self._find_while_cond(instructions, i, n)
             if while_cond is not None:
                 cond_jump, back_edge, loop_end = while_cond
@@ -4890,6 +4897,10 @@ class Decompiler:
         """
         if idx >= end or idx >= len(instructions):
             return 0
+        from .condition_graph import emit_mixed_if
+        mixed = emit_mixed_if(self, code, instructions, idx, end, stack, stmts)
+        if mixed:
+            return mixed
         operands: List[ast.expr] = []
         guards: List[int] = []
         i = idx
@@ -5726,6 +5737,10 @@ class Decompiler:
         limit: Optional[int] = None,
     ) -> int:
         """Emit an ``if``/``while`` construct for a POP_JUMP_IF_* instruction."""
+        from .condition_graph import emit_threaded_break
+        threaded = emit_threaded_break(self, cond, instructions, idx, stmts, limit)
+        if threaded:
+            return threaded
         target_idx = self._find_target_idx(instructions, target)
         if target_idx <= idx and self._loop_stack and target == self._loop_stack[-1][0]:
             # A condition that jumps back to the active loop head is an ``if`` in
@@ -6090,8 +6105,8 @@ class Decompiler:
                         break
                     body_end = i
                     else_start = current_end
-                    else_end = after
-                    end_idx = after
+                    else_end = min(after, limit) if limit is not None else after
+                    end_idx = else_end
                     break
             i += 1
         return body_start, body_end, else_start, else_end, end_idx
@@ -6348,6 +6363,10 @@ class Decompiler:
         returned = _NO_RETURN
         if term is not None and term.opname in ("RETURN_VALUE", "LOAD_CONST"):
             returned = self._with_return_value(instructions, term_idx, body_stack)
+        if returned is _NO_RETURN and body_stack:
+            # An enclosing finally may defer (or replace) RETURN_VALUE. The
+            # value was nevertheless evaluated while this manager was active.
+            returned = body_stack[-1]
 
         merge_idx = self._find_stmt_run_end(instructions, pop_idx, handler_start_idx)
         if returned is not _NO_RETURN:

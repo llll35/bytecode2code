@@ -333,11 +333,19 @@ class Region:
     #: in front of every exit, so a handler's exit looks like a second normal
     #: close of the enclosing region, one the body's text stops short of.
     exit_pops: List[int] = field(default_factory=list)
+    #: Closes reached after entering a nested with handler (possible suppression).
+    with_pops: List[int] = field(default_factory=list)
 
     @property
     def last_body_pop(self) -> Optional[int]:
         """The outermost closing pop, which is where the body's text ends."""
-        return self.body_pops[-1] if self.body_pops else self.body_end
+        candidates = list(self.body_pops)
+        if self.handlers and self.kind != KIND_WITH:
+            handler = self.handlers[0][0]
+            # A nested with can suppress an exception and resume before this
+            # region's own handler. Keep that enclosing-body close too.
+            candidates.extend(index for index in self.with_pops if index < handler)
+        return max(candidates) if candidates else self.body_end
 
     def covers(self, index: int) -> bool:
         return (self.body_start <= index
@@ -444,6 +452,7 @@ class ExceptionAnalyzer:
         handler_of = {position: handler for position, _, handler in sites}
         closes: Dict[int, Set[int]] = {}
         unwound: Dict[int, Set[int]] = {}
+        resumed: Dict[int, Set[int]] = {}
         while pending:
             number, stack = pending.pop()
             if (number, stack) in seen:
@@ -461,9 +470,10 @@ class ExceptionAnalyzer:
                     # are never simulated and stay without a body end.
                     handler = handler_of.get(index)
                     if handler is not None:
+                        flags = 1 | (2 if regions[index].kind == KIND_WITH else 0)
                         pending.append((
                             self.cfg.owner[handler],
-                            tuple((setup, True) for setup, _ in stack)))
+                            tuple((setup, tainted | flags) for setup, tainted in stack)))
                     if index not in {setup for setup, _ in stack}:
                         # A loop re-entering its own region arrives over the
                         # back edge with the region already on the stack;
@@ -478,6 +488,8 @@ class ExceptionAnalyzer:
                     if region is not None:
                         (unwound if tainted else closes).setdefault(
                             setup, set()).add(index)
+                        if tainted & 2:
+                            resumed.setdefault(setup, set()).add(index)
                         if region.body_end is None:
                             region.body_end = index
             for succ in block.successors:
@@ -498,9 +510,14 @@ class ExceptionAnalyzer:
             # it ends.
             region.body_pops = sorted(own or extra)
             region.exit_pops = sorted(extra) if own else []
+            region.with_pops = sorted(resumed.get(region.setup_index, ()))
             if region.body_end is None:
                 region.body_end = self._body_by_reachability(
                     region.setup_index, entries)
+            end = region.last_body_pop
+            if (end is not None and region.kind != KIND_WITH and region.handlers
+                    and any(index < region.handlers[0][0] for index in region.with_pops)):
+                region.body_end = end
         return [regions[position] for position in sorted(regions)]
 
     def _body_by_reachability(self, setup: int, entries: Set[int]) -> Optional[int]:

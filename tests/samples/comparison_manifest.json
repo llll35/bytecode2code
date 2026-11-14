@@ -1,0 +1,11 @@
+{
+  "origin": "D:\\build\\test-pyc",
+  "note": "Byte-for-byte archived originals; do not regenerate these fixtures.",
+  "files": [
+    {"file": "comparison_py39_feat39.pyc", "original": "py39/feat39.pyc", "version": "3.9", "source": "comparison_feat39.py", "sha256": "d6cb7b0b627fa6ea1168a9d735b13194731d5546d5fbfc4a92edfdecd9cb7a1a"},
+    {"file": "comparison_py312_hello.pyc", "original": "py312/hello_pycdc.pyc", "version": "3.12", "source": "comparison_hello312.py", "sha256": "a40d89ae9ee255f3bc16314aac85449abcade0bee67fe57c6ab142485cd95c20"},
+    {"file": "comparison_py312_t312b.pyc", "original": "py312/t312b.pyc", "version": "3.12", "source": "comparison_t312b.py", "sha256": "90af82875b8942b23d664a03357494cf172e98f445e8153f7bf8e6c476db793c"},
+    {"file": "comparison_py314_t314c.pyc", "original": "py314/t314c.pyc", "version": "3.14", "source": "comparison_t312c.py", "sha256": "792bfb055ed9f608974eb4da8ec824d75c8b26a55eb126bcc55448b16f0fa532"},
+    {"file": "comparison_py315_t315c.pyc", "original": "py315/t315c.pyc", "version": "3.15", "source": "comparison_t312c.py", "sha256": "f598eec0b800185dbd493f88fd64fbaefe214918478dee8d9b09f5826d86da4f"}
+  ]
+}

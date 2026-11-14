@@ -1,8 +1,146 @@
 # 项目缺陷清单（bugs.md）
 
-> 最后更新：2026-11-13。状态含义：
+> 最后更新：2026-11-14。状态含义：
 > **已修复** / **部分修复** / **未修复** / **不适用**。
 > 复现与验证命令见文末。
+
+---
+
+## 2026-11-14 用户实测原始 .pyc 回归（AK）
+
+**状态：同批 12 个小样本通过；argparse 大文件仍有差异，性能未优化。**
+直接读取用户提供的 `D:\build\test-pyc`，不重新生成输入，不以自选源码探针
+代替原始文件。3.9/3.12 使用归档记录中的 `D:\Python\python.exe` 与
+`D:\Python3.12.0\python.exe`，3.13–3.15 使用对应的嵌入式解释器。
+3.8 明确不支持，未尝试用不匹配的 marshal 加载。
+
+本批重点修复并新增严格回归：
+
+| 原始样本 | 发现的问题 | 当前结果 |
+|----------|------------|----------|
+| `py39/feat39.pyc` | with 体的 f.read 丢失、finally 误入 else、尾部伪代码 | **AST、code object、行为通过** |
+| `py314/t314c.pyc` | async with 变成 await Lock()()，真实 body 被删 | **AST、code object、行为通过** |
+| `py315/t315c.pyc` | 同上，并有 await 的 PUSH_NULL 编码差异 | **AST、code object、行为通过** |
+| `py312/hello_pycdc.pyc` | 返回型 if 被折成 IfExp，尾部 RETURN_CONST 改变 | **AST、code object、行为通过** |
+| `py312/t312b.pyc` | if/elif 被折成嵌套 IfExp | **AST、code object、行为通过** |
+
+这五份原始字节码已逐字节复制到 `tests/samples/comparison_*.pyc`，
+`comparison_manifest.json` 记录来源、版本和 SHA-256；单测加载前校验哈希。
+原始目录没有改动。其余 7 个小样本也按原始 .pyc 对照，合计 **12/12**。
+不将“能输出源码”视为成功，也没有修改 `tests/equivalence.py` 或旧压力样例。
+
+根因与修复：
+
+- **被抑制的 with 异常也是可继续的路径。** block-stack CFG 原先只用普通
+  路径的 POP_BLOCK，忽略 nested with handler 抑制异常后继续执行的 close，
+  将外层 try/finally 截在正常 return 的早期 close。3.9/3.10/3.14/3.15
+  现在区分一般 unwind 与经过 with handler 的路径，保留后者在自身 handler
+  之前的 close；不把普通 except/finally 的 unwind 或 with 自己的 teardown
+  一律当成 body 末尾。pending return 的值仍在 with 内求值，不能搬到退出后。
+- **3.14/3.15 async prefix 并非 BEFORE_ASYNC_WITH。** COPY/LOAD_SPECIAL 的
+  `__aexit__`/`__aenter__` 配对现被识别；入口 await 之前发射 BEFORE_ASYNC_WITH，
+  保护区开始才发射 SETUP_ASYNC_WITH。3.15 的 entry await 回溯接受 PUSH_NULL。
+  with handler 中的 `await __aexit__()` 按 SEND 的完成边跨过，不发射成源码。
+- **CLEANUP_THROW 不是源级 except 的尾部合流。** 3.14/3.15 把 await 的辅助
+  cleanup 放在函数尾，回跳 END_SEND；原先将它当作 duplicated-tail handler，
+  把 END_SEND 后面的真实 body 整段搬走。现在不对这些辅助入口做该重排。
+- **with 抑制异常后跨出外层 except，仍需关掉合成块。** 3.14/3.15 的原生
+  exception table 没有 POP_BLOCK，但其 with handler 的成功跳转会越过外层
+  except handler。重写时为已匹配的 enclosing except 补 close，避免遗漏普通
+  finally 副本或在返回之后再发射 print('done')。
+- **return 语句不等于返回条件表达式。** 3.11–3.15 用源跨度约束 return-IfExp
+  的猜测；独立 return 语句继续交给 if reader。3.12 的 returning elif 使用
+  可用列信息保留 keyword 与 body 归属，而非折成 IfExp。3.13 已由 Rewriter
+  归一化的 RETURN_CONST 位置不再重复减去 `return ` 的宽度。
+
+`tests/test_comparison_regression.py` 在七解释器 **26/26** 适用测试通过，
+16 项按归档版本/列信息跳过。覆盖文件读取、enter/exit、异常抑制真值测试、
+finally 覆盖异常、async entry/body/exit 的真实挂起、取消传播、提前返回和
+退出后续段；仅使用受控文件/管理器，不读取真实 `nofile.txt`。
+旧 nightmare/tripwire/ambush 回归 **211/211** 仍通过，合计 **237/237**。
+旧门禁保持 ROUND-TRIP **263/263**、CONTROL FLOW **77/77**、组合控制流
+**18/18**、CRASH **56/56**，CFG/输出归一化检查也通过。
+
+**argparse 仍未修复：** 同一份 3.12.0 `.pyc` 的输出有 import alias、
+`_copy_items` 等 code-object 差异，不能纳入完整还原成绩。单独、顺序运行
+三次 `D:\Python3.12.0\python.exe main.py decompile ...\argparse.pyc`，含启动
+的实测为 **2638.5 / 2518.5 / 2578.9 ms**，中位数 **2578.9 ms**。
+先前并行回归时的 3.6–4.7 秒不作为无负载性能结论；本批未做性能优化。
+
+记录：`_scratch/comparison_batch_after.json`、
+`_scratch/comparison_argparse_idle.json`、`_scratch/comparison_regression.json`、
+`_scratch/comparison_gate_verified.txt` 及逐版本原始/发射源码与回归日志。
+
+```powershell
+.\embed_python\python-3.9\python.exe tests/test_comparison_regression.py
+.\embed_python\python-3.12\python.exe tests/test_comparison_regression.py
+.\embed_python\python-3.14\python.exe tests/test_comparison_regression.py
+.\embed_python\python-3.15\python.exe tests/test_comparison_regression.py
+python tests/run.py
+```
+
+---
+
+## 2026-11-14 ambush.py 普通混合布尔分支与循环（AJ）
+
+**状态：新增压力样例触发的错误已修复。** 新增独立 `ambush.py`，不重复上一批
+match 用例，改测普通 `if a and (b or c)`、`if a or (b and c)`、左侧分组、
+单项 not、try/except/finally，以及混合条件的 while、break/else 和循环清理。
+10 个用例在七版本均适用；修复前 **0/70**，且 **70** 个版本/用例组合都有
+实际行为差异。修复后相同脚本 **70/70**，**2604** 组行为场景全部一致。
+
+每个用例同时要求源码 AST、原有递归 code-object 比较与行为一致。真值对象
+按序改变返回值并可抛 ValueError，记录每次测试的对象、次数和结果；清理可
+抛 RuntimeError，比较返回值、完整事件顺序与异常链。脚本有 256 事件预算和
+180 秒子进程超时，避免错误循环挂死测试。没有修改 `nightmare.py`、
+`tripwire.py`、`tests/equivalence.py` 或用户的 `prepare.py`。
+
+根因与修复：
+
+- **普通 reader 仍只接受平面短路链。** 之前的模式 guard 已支持混合图，但
+  普通 if/while 仍假定所有前置跳转只进入 body 或退出，混合跳转会被拆成
+  嵌套 if/pass，甚至不再读取 b/c。各后端新增独立 `condition_graph.py`，
+  将操作数测试、内部边、成功与失败端点还原为 and/or 图，不重复求值或
+  真值测试。3.10–3.15 复用各自 pattern reader 的纯图分解器，3.9 保留
+  自己的分解实现；没有跨后端导入。旧平面条件与值位置 and/or 保持原路径。
+- **循环头必须是完整条件。** 新 reader 在旧的首个 guard 嗅探之前识别
+  混合 while，不把 b/c 留到循环 body。3.9、3.14、3.15 读取回到条件头的
+  最后自然 latch；3.10–3.13 对重复 footer 的 AST 与源码头做归属验证，
+  不把另一条循环回边当作条件副本。3.12/3.13 的成功路径还多一个
+  JUMP_ABSOLUTE trampoline，按已知端点跨过它，不能把 footer 发射成 if。
+- **else 不能越过当前异常范围。** `_split_branch` 只限制 false 目标，
+  却未限制 then 末尾跳转的合流点；被搬到 handler 后面的续段使 if-else
+  吞入 except/finally，正常 miss 路径使用未绑定的 error。七个 reader
+  现在同时限制 else_end/end_idx，不越过传入的 emission limit。
+- **自然 latch 之后还有真实 break。** 3.14/3.15 把条件 break 的跳转 stub
+  放在自然回边之后；按回边截 body 会丢掉 break，误发 `if not test: pass`，
+  还会把 while-else 放到循环外。新循环边界保留这些 exit stubs；条件
+  reader 根据 loop target 与 guard/latch 同源行恢复原极性的 `if test: break`，
+  不把别处显式写出的 continue 猜成自然 latch。
+
+新增 `tests/test_ambush_regression.py`，七版本 **49/49** 通过，另外覆盖
+body 的嵌套 if 不并入条件、函数操作数只调用一次、walrus 操作数、值表达式
+返回原对象、旧平面条件源码形状与有环图拒绝猜测。与旧 nightmare/tripwire
+回归合计 **211/211** 适用测试通过，另 27 项保持原有按版本跳过。
+旧门禁保持 ROUND-TRIP **263/263**、CONTROL FLOW **77/77**、组合控制流
+**18/18**、CRASH **56/56**；`tripwire.py` **98/98**，`nightmare.py`
+仍为 **82/94**，原有 12 项信息丢失 AST 差异未改变。
+
+本批限定同一条件头的混合布尔控制流，不宣称已解决任意多行混合条件、所有
+复杂比较/条件表达式或剩余匹配语法。修改以方法锚点接入七个后端，没有
+整文件覆盖其它版本的 reader。
+
+记录：`_scratch/ambush_before.json`、`_scratch/ambush_after.json`、
+`_scratch/ambush_regression.json`、`_scratch/ambush_gate_after.txt`、
+`_scratch/ambush_tripwire_after.json`、`_scratch/ambush_nightmare_after.txt`。
+
+```powershell
+python ambush.py
+python ambush.py --version 3.12 --verbose
+python ambush.py --json ambush-results.json
+.\embed_python\python-3.14\python.exe tests/test_ambush_regression.py
+python tests/run.py
+```
 
 ---
 

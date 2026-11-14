@@ -80,6 +80,7 @@ Project itself:
 ```
 main.py                 the CLI: routes a .pyc to the back end for its version
 tripwire.py             adversarial AST/code-object/behavior round-trip driver
+ambush.py               mixed Boolean branch/loop/cleanup stress driver
 
 py39Decompiler/         the 3.9 back end, and the shape every other one targets
   pyc_parser.py         .pyc header decoding, magic -> version, marshal read
@@ -108,6 +109,8 @@ tests/
   test_crash_regression.py stack/cleanup/short-circuit regression for 3.9–3.15
   test_nightmare_regression.py focused pattern/loop/finally regressions for 3.9–3.15
   test_tripwire_regression.py nested-pattern and guard decision-graph regressions
+  test_ambush_regression.py mixed ordinary conditions and loop-footer regressions
+  test_comparison_regression.py original comparison .pyc fixtures and protocol checks
   repro/                one-off reproduction inputs
 
 embed_python/           the seven CPython interpreters (not tracked)
@@ -203,6 +206,34 @@ python tripwire.py --version 3.14 --case mapping_nested --verbose
 python tripwire.py --json tripwire-results.json
 embed_python/python-3.14/python.exe tests/test_tripwire_regression.py
 ```
+
+`python ambush.py` exercises ordinary mixed Boolean `if`/`while` conditions,
+including changing truth values, exceptions, `break`/`else` and `finally`.
+It passes **70/70** strict round trips and **2604** behavioral scenarios on
+3.9–3.15. Each back end has a self-contained `condition_graph.py` for these
+mixed tests; flat chains and value expressions retain their existing readers.
+
+```
+python ambush.py --version 3.12 --verbose
+python ambush.py --json ambush-results.json
+embed_python/python-3.14/python.exe tests/test_ambush_regression.py
+```
+
+The original failing files from `D:\build\test-pyc` are archived byte-for-byte
+under `tests/samples/comparison_*.pyc`, with checksums in
+`tests/samples/comparison_manifest.json`. Run their structure and observable
+behavior regressions with the matching interpreter:
+
+```
+embed_python/python-3.9/python.exe tests/test_comparison_regression.py
+embed_python/python-3.12/python.exe tests/test_comparison_regression.py
+embed_python/python-3.14/python.exe tests/test_comparison_regression.py
+embed_python/python-3.15/python.exe tests/test_comparison_regression.py
+```
+
+All 12 small files in that comparison batch now pass strict AST/code-object
+checks. `argparse.pyc` is a separate benchmark: its output still has known
+code-object differences and is not counted as a successful reconstruction.
 
 ## Limitations
 

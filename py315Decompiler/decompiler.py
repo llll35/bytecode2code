@@ -2294,6 +2294,13 @@ class Decompiler:
                 continue
             # Test loop heads only after excluding consumed handler ranges;
             # an out-of-line handler can jump back into the ordinary body.
+            if not stack and instructions[i].opname in (
+                    "LOAD_FAST", "LOAD_NAME", "LOAD_GLOBAL", "LOAD_DEREF", "LOAD_CONST"):
+                from .condition_graph import emit_mixed_while
+                mixed_loop = emit_mixed_while(self, code, instructions, i, n, stmts)
+                if mixed_loop:
+                    i += mixed_loop
+                    continue
             while_cond = self._find_while_cond(instructions, i, n)
             if while_cond is not None:
                 cond_jump, back_edge, loop_end = while_cond
@@ -5168,6 +5175,10 @@ class Decompiler:
         """
         if idx >= end or idx >= len(instructions):
             return 0
+        from .condition_graph import emit_mixed_if
+        mixed = emit_mixed_if(self, code, instructions, idx, end, stack, stmts)
+        if mixed:
+            return mixed
         operands: List[ast.expr] = []
         guards: List[int] = []
         i = idx
@@ -5767,6 +5778,9 @@ class Decompiler:
         # statement matches the original source more closely.
 
         if allow_return:
+            from .condition_graph import returns_are_statements
+            if merge_jump is None and returns_are_statements(instructions, cond_jump, else_idx):
+                return 0
             # Nested conditional expressions cannot be split by the linear scans
             # below, because each arm is itself a guarded region rather than a
             # straight-line expression.  Parse the whole range as one recursive
@@ -6004,6 +6018,10 @@ class Decompiler:
         limit: Optional[int] = None,
     ) -> int:
         """Emit an ``if``/``while`` construct for a POP_JUMP_IF_* instruction."""
+        from .condition_graph import emit_threaded_break
+        threaded = emit_threaded_break(self, cond, instructions, idx, stmts, limit)
+        if threaded:
+            return threaded
         target_idx = self._find_target_idx(instructions, target)
         if target_idx <= idx and self._loop_stack and target == self._loop_stack[-1][0]:
             # A condition that jumps back to the active loop head is an ``if`` in
@@ -6080,6 +6098,11 @@ class Decompiler:
             else_stmts = self._emit_statements(
                 code, instructions, is_module=False, start=else_start, end=else_end
             )
+        elif body_stmts and isinstance(body_stmts[-1], ast.Return):
+            from .condition_graph import returning_elif
+            chain = returning_elif(self, code, instructions, idx, body_end, end_idx, range_end)
+            if chain is not None:
+                else_stmts, end_idx = chain
         if not body_stmts and not else_stmts and not is_module:
             # A branch with an empty body and no else arm is an ``if`` whose
             # body was ``pass`` -- the only source that compiles to nothing.
@@ -6362,8 +6385,8 @@ class Decompiler:
                         break
                     body_end = i
                     else_start = current_end
-                    else_end = after
-                    end_idx = after
+                    else_end = min(after, limit) if limit is not None else after
+                    end_idx = else_end
                     break
             i += 1
         return body_start, body_end, else_start, else_end, end_idx
